@@ -15,9 +15,9 @@ from typing import Optional, Dict, List, Any # Added Any
 
 # Define paths for persistent data - ENSURE THESE DIRECTORIES ARE WRITABLE
 DEFAULT_MEMORY_PATH = "/home/server/wdiscordbot/mind.json"
-DEFAULT_HISTORY_PATH = "ai_conversation_history.json"
+DEFAULT_HISTORY_PATH = "ai_conversation_history_neru.json"
 DEFAULT_MANUAL_CONTEXT_PATH = "ai_manual_context.json"
-DEFAULT_DYNAMIC_LEARNING_PATH = "ai_dynamic_learning.json" # New file for dynamic learning examples
+DEFAULT_DYNAMIC_LEARNING_PATH = "ai_dynamic_learning_neru.json" # New file for dynamic learning examples
 
 class AICog(commands.Cog):
     def __init__(self, bot: commands.Bot):
