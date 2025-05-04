@@ -6,7 +6,7 @@ import asyncio
 from discord import app_commands
 
 # Load environment variables
-load_dotenv("/home/server/keys.env")
+load_dotenv("/home/server/akita.env")
 discord_token = os.getenv("DISCORD_TOKEN")
 
 # Ensure token is set
@@ -21,7 +21,7 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Load cog files dynamically
 async def load_cogs():
-    for filename in os.listdir("/home/server/wdiscordbot/cogs"):
+    for filename in os.listdir("/home/server/neruaibot/cogs"):
         if filename.endswith(".py"):
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
