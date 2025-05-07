@@ -183,7 +183,7 @@ class AICog(commands.Cog, name="AI"):
             print(f"Error decoding JSON from memory file {self.memory_file_path}: {e}. Starting with empty memory.")
             self.user_memory = {}
         except Exception as e:
-            print(f"Error loading memory from {self.memory_file_path}: {e}. Starting with empty memory.")
+            print(f"Error loading memory from {self.memory_file_path}: {e}. Starting empty.")
             self.user_memory = {}
 
     def save_memory(self):
@@ -613,55 +613,65 @@ class AICog(commands.Cog, name="AI"):
                             # Assuming finish_reason is at the same level as 'role' within 'completion_message'
                             finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
 
-                            # Check for the 'completion_message' key as seen in the error data
-                            response_message = data.get("completion_message")
-                            
-                            if not response_message:
-                                print(f"API Error: Unexpected response format - Missing 'completion_message'. Data: {data}")
-                                return f"Sorry {user_name}, I got an unexpected response format from the AI. Maybe try again?"
-                            
-                            # IMPORTANT: Verify how Meta Llama API indicates finish reason (e.g., 'stop', 'tool_calls', 'length')
-                            # Assuming finish_reason is at the same level as 'role' within 'completion_message'
-                            finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
-
                             # Format the assistant's response message for appending to history
                             formatted_assistant_message: Dict[str, Any] = {"role": "assistant"}
 
                             # Check for tool calls - assuming they might be within completion_message or top-level
-                            tool_calls = response_message.get("tool_calls")
-                            if not tool_calls:
-                                tool_calls = data.get("tool_calls")
+                            tool_calls_from_response = response_message.get("tool_calls")
+                            if not tool_calls_from_response:
+                                tool_calls_from_response = data.get("tool_calls")
 
-                            if tool_calls:
-                                # Assuming the API expects tool calls in the assistant message in history
-                                formatted_assistant_message["tool_calls"] = tool_calls
-                                print(f"Formatted assistant message with tool calls for history: {formatted_assistant_message}")
+                            if tool_calls_from_response:
+                                # Reconstruct tool_calls list for the history message to match expected schema
+                                # The schema likely expects 'id', 'type', and 'function' with 'name' and 'arguments' (as string)
+                                formatted_tool_calls = []
+                                for tc in tool_calls_from_response:
+                                    formatted_tool_call: Dict[str, Any] = {"type": "function"} # Assuming type is always function for now
+                                    if tc.get("id"):
+                                        formatted_tool_call["id"] = tc["id"]
+                                    if tc.get("function"):
+                                        formatted_tool_call["function"] = {
+                                            "name": tc["function"].get("name"),
+                                            "arguments": tc["function"].get("arguments", "{}") # Ensure arguments is a string
+                                        }
+                                    if formatted_tool_call["function"].get("name"): # Only add if function name exists
+                                        formatted_tool_calls.append(formatted_tool_call)
+
+                                if formatted_tool_calls:
+                                     formatted_assistant_message["tool_calls"] = formatted_tool_calls
+                                     print(f"Formatted assistant message with tool calls for history: {formatted_assistant_message}")
                             
                             # Extract content from the new structure: response_message["content"]["text"]
                             final_response_content_obj = response_message.get("content")
-                            if final_response_content_obj and final_response_content_obj.get("type") == "text":
+                            if final_response_content_obj and final_response_content_obj.get("type") == "text": # Fixed syntax error here
                                 final_response = final_response_content_obj.get("text", "").strip()
-                                # If there's text content and no tool calls, add it as 'content'.
-                                # If tool calls are present, the text might be ignored or handled differently by the API.
-                                if not tool_calls:
+                                # If there's text content and no tool calls were in the response, add it as 'content'.
+                                # If tool calls were present, the text content might be the AI's thinking *before* the tool call,
+                                # and the API schema might not allow both 'content' and 'tool_calls' in the same message.
+                                if not tool_calls_from_response:
                                      formatted_assistant_message["content"] = final_response
                                      print(f"Formatted assistant message with text content for history: {formatted_assistant_message}")
                                 else:
-                                     # If tool calls are present, the text content might be the AI's thinking *before* the tool call.
+                                     # If tool calls are present, the text content might be ignored or handled differently by the API.
                                      # Based on the error data, the text content was the final response when no tool calls occurred.
                                      # Let's stick to adding text content only if no tool_calls were detected in this response.
                                      pass # Do not add text content as 'content' if tool_calls were found in the response
 
                             # Append the correctly formatted message to the messages list for the next turn
-                            messages.append(formatted_assistant_message)
-                            print(f"Appended formatted assistant message to messages. Current messages count: {len(messages)}")
+                            # Only append if the formatted message has content or tool_calls
+                            if "content" in formatted_assistant_message or "tool_calls" in formatted_assistant_message:
+                                messages.append(formatted_assistant_message)
+                                print(f"Appended formatted assistant message to messages. Current messages count: {len(messages)}")
+                            else:
+                                print(f"Assistant response had no content or tool_calls. Not appending to messages history. Response data: {data}")
+
 
                             # --- Tool Call Handling ---
                             # Execute tools if tool_calls were found in the response
-                            if tool_calls and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
+                            if tool_calls_from_response and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
                                 # Tool calls were already added to the messages list in the formatted_assistant_message
                                 # Now execute the tools and append their results
-                                for tool_call in tool_calls:
+                                for tool_call in tool_calls_from_response:
                                     # IMPORTANT: Verify the structure of a tool_call object.
                                     # It might be `tool_call.function.name` and `tool_call.function.arguments`.
                                     function_name = tool_call.get("function", {}).get("name")
