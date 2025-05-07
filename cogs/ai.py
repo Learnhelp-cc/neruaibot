@@ -602,24 +602,37 @@ class AICog(commands.Cog, name="AI"):
                             data = await response.json()
                             # print(f"Received data from AI: {json.dumps(data, indent=2)}") # For debugging
 
-                            if not data.get("choices") or not data["choices"][0].get("message"):
-                                print(f"API Error: Unexpected response format. Data: {data}")
-                                return f"Sorry {user_name}, I got an unexpected response from the AI. Maybe try again?"
+                            # Check for the 'completion_message' key as seen in the error data
+                            response_message = data.get("completion_message")
                             
-                            response_message = data["choices"][0]["message"]
+                            if not response_message:
+                                print(f"API Error: Unexpected response format - Missing 'completion_message'. Data: {data}")
+                                return f"Sorry {user_name}, I got an unexpected response format from the AI. Maybe try again?"
+                            
                             # IMPORTANT: Verify how Meta Llama API indicates finish reason (e.g., 'stop', 'tool_calls', 'length')
-                            finish_reason = data["choices"][0].get("finish_reason", "stop") # Default to 'stop' if not provided
+                            # Assuming finish_reason is at the same level as 'role' within 'completion_message'
+                            finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
 
                             # Append assistant's current thought/response to messages list for context,
                             # even if it's a tool call request.
+                            # Note: The structure of response_message itself might need adjustment here
+                            # if the API's message object structure is different from the expected role/content.
+                            # Based on the error, the message object seems to be the value of 'completion_message'.
                             messages.append(response_message)
 
                             # --- Tool Call Handling ---
                             # IMPORTANT: Verify how Meta Llama API returns tool calls.
                             # It might be `response_message.get("tool_calls")` or `response_message.get("function_call")`.
                             # The structure of tool_calls objects also needs to be verified.
-                            if response_message.get("tool_calls") and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
-                                tool_calls = response_message["tool_calls"]
+                            # Assuming tool_calls might be a key within the completion_message or another top-level key.
+                            # Based on the error data, tool_calls were NOT present in the completion_message.
+                            # Let's check if tool_calls is a top-level key or within completion_message.
+                            # For now, I'll keep the check on response_message, but this might need adjustment.
+                            tool_calls = response_message.get("tool_calls") # Check within completion_message
+                            if not tool_calls:
+                                tool_calls = data.get("tool_calls") # Check if it's a top-level key
+
+                            if tool_calls and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
                                 print(f"AI requested tool calls (Iteration {iteration + 1}): {tool_calls}")
 
                                 for tool_call in tool_calls:
@@ -700,8 +713,10 @@ class AICog(commands.Cog, name="AI"):
                                 continue # To the top of the for loop for next API call
 
                             # --- No Tool Calls, or Finished After Tool Calls ---
-                            elif response_message.get("content"):
-                                final_response = response_message["content"].strip()
+                            # Extract content from the new structure: response_message["content"]["text"]
+                            final_response_content_obj = response_message.get("content")
+                            if final_response_content_obj and final_response_content_obj.get("type") == "text":
+                                final_response = final_response_content_obj.get("text", "").strip()
                                 print(f"AI Response for {user_name} (iter {iteration+1}): {final_response[:150]}...")
 
                                 # Add interaction to history (both user prompt and AI final response)
@@ -712,7 +727,7 @@ class AICog(commands.Cog, name="AI"):
                                 return final_response
                             
                             else: # No content and no tool calls, or unexpected finish_reason
-                                print(f"API Error: No content and no tool calls in response, or unexpected finish_reason '{finish_reason}'. Data: {data}")
+                                print(f"API Error: No text content and no tool calls in response, or unexpected finish_reason '{finish_reason}'. Data: {data}")
                                 if iteration < max_tool_iterations -1 and finish_reason != "stop": # If not stop, maybe it needs to continue
                                     messages.append({"role":"user", "content":"[System Note] Please provide a textual response or use a tool correctly."})
                                     print(f"No content/tool calls, but finish_reason '{finish_reason}'. Appending system note and continuing.")
