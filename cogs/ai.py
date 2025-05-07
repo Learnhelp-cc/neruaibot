@@ -754,7 +754,56 @@ class AICog(commands.Cog, name="AI"):
             traceback.print_exc()
             await interaction.followup.send("Oh no! Something went wrong while I was trying to respond. My circuits are buzzing! 😵 Please try again.")
 
+    # --- Discord Event Listeners ---
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Handles messages to respond when the bot is pinged."""
+        # Ignore messages from the bot itself
+        if message.author == self.bot.user:
+            return
 
+        # Check if the bot is mentioned in the message
+        # message.mentions contains a list of User/Member objects mentioned
+        if self.bot.user in message.mentions:
+            # Extract the message content after the mention
+            # This regex finds the bot mention at the start and captures the rest
+            mention_regex = re.compile(rf"<@!?{self.bot.user.id}>\s*")
+            content = mention_regex.sub("", message.content).strip()
+
+            if not content:
+                # If only the bot was mentioned with no text, maybe send a default greeting or ignore
+                # For now, let's ignore empty messages after mention
+                return
+
+            # Process the message content using the AI
+            user_id = str(message.author.id)
+            user_name = message.author.display_name
+
+            # Indicate bot is thinking (optional for message listener, but good practice)
+            # await message.channel.trigger_typing() # This can be spammy in busy channels
+
+            try:
+                response_text = await self.generate_response(user_id, user_name, content, source_message=message)
+
+                # Send response in chunks if too long
+                if len(response_text) > 2000:
+                    for i in range(0, len(response_text), 1990):
+                        chunk = response_text[i:i+1990]
+                        await message.channel.send(chunk)
+                else:
+                    await message.channel.send(response_text)
+
+            except Exception as e:
+                print(f"Error in on_message for user {user_name} ({user_id}): {e}")
+                import traceback
+                traceback.print_exc()
+                await message.channel.send("Oh no! Something went wrong while I was trying to respond to your mention. 😵")
+
+        # Allow other message processing (e.g., commands) to continue
+        await self.bot.process_commands(message)
+
+
+    # --- Discord Slash Commands ---
     @app_commands.command(name="setaiconfig", description="Set your personal AI model configuration (e.g., temperature).")
     @app_commands.describe(
         model="Model identifier (optional, consult bot owner for available models)",
