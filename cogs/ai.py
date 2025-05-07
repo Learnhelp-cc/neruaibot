@@ -65,7 +65,7 @@ class AICog(commands.Cog, name="AI"):
         # --- Default AI Configuration ---
         # IMPORTANT: Verify these parameters and their names/values are compatible with the Meta Llama Preview API.
         self.default_config = {
-            "model": "meta-llama/Llama-3-70b-chat-hf", # Example, ensure this is a valid model for the Meta Llama Preview API
+            "model": "Llama-4-Maverick-17B-128E-Instruct-FP8", # Example, ensure this is a valid model for the Meta Llama Preview API
             "temperature": 0.75,
             "max_tokens": 1500, # Meta Llama API might use 'max_gen_len' or 'max_new_tokens'
             "top_p": 0.9,
