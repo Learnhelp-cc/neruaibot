@@ -613,28 +613,54 @@ class AICog(commands.Cog, name="AI"):
                             # Assuming finish_reason is at the same level as 'role' within 'completion_message'
                             finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
 
-                            # Append assistant's current thought/response to messages list for context,
-                            # even if it's a tool call request.
-                            # Note: The structure of response_message itself might need adjustment here
-                            # if the API's message object structure is different from the expected role/content.
-                            # Based on the error, the message object seems to be the value of 'completion_message'.
-                            messages.append(response_message)
+                            # Check for the 'completion_message' key as seen in the error data
+                            response_message = data.get("completion_message")
+                            
+                            if not response_message:
+                                print(f"API Error: Unexpected response format - Missing 'completion_message'. Data: {data}")
+                                return f"Sorry {user_name}, I got an unexpected response format from the AI. Maybe try again?"
+                            
+                            # IMPORTANT: Verify how Meta Llama API indicates finish reason (e.g., 'stop', 'tool_calls', 'length')
+                            # Assuming finish_reason is at the same level as 'role' within 'completion_message'
+                            finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
+
+                            # Format the assistant's response message for appending to history
+                            formatted_assistant_message: Dict[str, Any] = {"role": "assistant"}
+
+                            # Check for tool calls - assuming they might be within completion_message or top-level
+                            tool_calls = response_message.get("tool_calls")
+                            if not tool_calls:
+                                tool_calls = data.get("tool_calls")
+
+                            if tool_calls:
+                                # Assuming the API expects tool calls in the assistant message in history
+                                formatted_assistant_message["tool_calls"] = tool_calls
+                                print(f"Formatted assistant message with tool calls for history: {formatted_assistant_message}")
+                            
+                            # Extract content from the new structure: response_message["content"]["text"]
+                            final_response_content_obj = response_message.get("content")
+                            if final_response_content_obj and final_response_content_obj.get("type") == "text":
+                                final_response = final_response_content_obj.get("text", "").strip()
+                                # If there's text content and no tool calls, add it as 'content'.
+                                # If tool calls are present, the text might be ignored or handled differently by the API.
+                                if not tool_calls:
+                                     formatted_assistant_message["content"] = final_response
+                                     print(f"Formatted assistant message with text content for history: {formatted_assistant_message}")
+                                else:
+                                     # If tool calls are present, the text content might be the AI's thinking *before* the tool call.
+                                     # Based on the error data, the text content was the final response when no tool calls occurred.
+                                     # Let's stick to adding text content only if no tool_calls were detected in this response.
+                                     pass # Do not add text content as 'content' if tool_calls were found in the response
+
+                            # Append the correctly formatted message to the messages list for the next turn
+                            messages.append(formatted_assistant_message)
+                            print(f"Appended formatted assistant message to messages. Current messages count: {len(messages)}")
 
                             # --- Tool Call Handling ---
-                            # IMPORTANT: Verify how Meta Llama API returns tool calls.
-                            # It might be `response_message.get("tool_calls")` or `response_message.get("function_call")`.
-                            # The structure of tool_calls objects also needs to be verified.
-                            # Assuming tool_calls might be a key within the completion_message or another top-level key.
-                            # Based on the error data, tool_calls were NOT present in the completion_message.
-                            # Let's check if tool_calls is a top-level key or within completion_message.
-                            # For now, I'll keep the check on response_message, but this might need adjustment.
-                            tool_calls = response_message.get("tool_calls") # Check within completion_message
-                            if not tool_calls:
-                                tool_calls = data.get("tool_calls") # Check if it's a top-level key
-
+                            # Execute tools if tool_calls were found in the response
                             if tool_calls and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
-                                print(f"AI requested tool calls (Iteration {iteration + 1}): {tool_calls}")
-
+                                # Tool calls were already added to the messages list in the formatted_assistant_message
+                                # Now execute the tools and append their results
                                 for tool_call in tool_calls:
                                     # IMPORTANT: Verify the structure of a tool_call object.
                                     # It might be `tool_call.function.name` and `tool_call.function.arguments`.
@@ -642,11 +668,11 @@ class AICog(commands.Cog, name="AI"):
                                     tool_call_id = tool_call.get("id") # OpenAI style
                                     
                                     if not function_name or not tool_call_id:
-                                        print(f"Invalid tool call structure received: {tool_call}")
+                                        print(f"Invalid tool call structure received during execution: {tool_call}")
                                         messages.append({
                                             "role": "tool",
                                             "tool_call_id": tool_call_id or "unknown_tool_id",
-                                            "content": "Error: Received an invalid tool call structure from AI."
+                                            "content": "Error: Received an invalid tool call structure from AI during execution."
                                         })
                                         continue # Next tool call or next iteration
 
@@ -713,10 +739,11 @@ class AICog(commands.Cog, name="AI"):
                                 continue # To the top of the for loop for next API call
 
                             # --- No Tool Calls, or Finished After Tool Calls ---
-                            # Extract content from the new structure: response_message["content"]["text"]
-                            final_response_content_obj = response_message.get("content")
-                            if final_response_content_obj and final_response_content_obj.get("type") == "text":
-                                final_response = final_response_content_obj.get("text", "").strip()
+                            # If we reached here, it means either no tool calls were detected in the response,
+                            # or tool calls were processed and we are now expecting a final text response.
+                            # Check if the formatted_assistant_message already has content (from text response)
+                            if "content" in formatted_assistant_message:
+                                final_response = formatted_assistant_message["content"]
                                 print(f"AI Response for {user_name} (iter {iteration+1}): {final_response[:150]}...")
 
                                 # Add interaction to history (both user prompt and AI final response)
