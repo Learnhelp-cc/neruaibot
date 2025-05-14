@@ -32,7 +32,7 @@ class AICog(commands.Cog, name="AI"):
             print("WARNING: AI_API_KEY environment variable not found. AI features will be disabled.")
         # IMPORTANT: Verify this is the correct endpoint for the Meta Llama Preview API.
         # It might have a version prefix, a 'preview' segment, or a different subdomain.
-        self.api_url = os.getenv("LLAMA_API_URL", "https://api.llama.com/v1/chat/completions") # Placeholder
+        self.api_url = os.getenv("LLAMA_API_URL", "https://openrouter.ai/api/v1/chat/completions") # Placeholder
         # -------------------------
 
         self.security_code = os.getenv("SERVICE_CODE") # For privileged commands
@@ -146,8 +146,6 @@ class AICog(commands.Cog, name="AI"):
                     },
                 },
             }
-            # Add more tools here if needed, e.g., for web search, calendar, etc.
-            # Ensure each tool has a corresponding handler method in this class.
         ]
         # ------------------------
 
@@ -563,11 +561,9 @@ class AICog(commands.Cog, name="AI"):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            # Meta Llama API might require specific headers, e.g., for user agent or referrals.
-            # "HTTP-Referer": "https://your-discord-bot-project-url.com", # Optional, verify if needed
-            # "X-Title": "Kasane Teto Discord Bot" # Optional, verify if needed
         }
 
+        self.api_url = os.getenv("OPENROUTER_API_URL", "https://api.openrouter.ai/chat/completions")
         max_tool_iterations = 5 # Prevent infinite loops of tool calls
         for iteration in range(max_tool_iterations):
             payload = {
