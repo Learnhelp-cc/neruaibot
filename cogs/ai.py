@@ -121,44 +121,6 @@ class AICog(commands.Cog):
 
         # --- Tool Definitions ---
         self.tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_safe_shell_command",
-                    "description": "Executes a simple, safe, read-only shell command if necessary to answer a user's question (e.g., get current date, list files, check uptime). Prohibited commands include file modification, cat, sudo, etc.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": {
-                                "type": "string",
-                                "description": "The safe shell command to execute (e.g., 'date', 'ls -l', 'ping -c 1 google.com').",
-                            }
-                        },
-                        "required": ["command"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "remember_fact_about_user",
-                    "description": "Stores a concise fact learned about the user during the conversation (e.g., 'likes pineapple pizza', 'favorite color is blue', 'has a dog named Sparky').",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "user_id": {
-                                "type": "string",
-                                "description": "The Discord User ID of the user the fact pertains to.",
-                            },
-                             "fact": {
-                                "type": "string",
-                                "description": "The specific, concise fact to remember about the user.",
-                            }
-                        },
-                        "required": ["user_id", "fact"],
-                    },
-                },
-            }
         ]
         # ------------------------
 
