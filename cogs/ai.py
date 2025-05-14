@@ -1,85 +1,100 @@
-import discord
+import discord # type: ignore
+import discord # type: ignore
 import json
 import os
-import aiohttp
+import aiohttp # type: ignore
 import asyncio
-import random # For emoji reactions
+import random # Added for emoji reactions
 import re
-import urllib.parse # For search query encoding
-import subprocess # For shell commands
+from functools import partial # For asyncio.to_thread with args
+try:
+    from transformers import pipeline as hf_pipeline # type: ignore
+    from transformers import AutoTokenizer # type: ignore
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    hf_pipeline = None
+    AutoTokenizer = None
+import urllib.parse
+import subprocess
 from datetime import datetime, timedelta
-from discord.ext import commands
-from discord import app_commands
-from typing import Optional, Dict, List, Any
+from discord.ext import commands # type: ignore
+from discord import app_commands # type: ignore
+from typing import Optional, Dict, List, Any # Added Any
 
 # Define paths for persistent data - ENSURE THESE DIRECTORIES ARE WRITABLE
-# It's good practice to place these in a dedicated data directory.
-DATA_DIR = os.path.join(os.path.dirname(__file__), "bot_data") # Assumes bot_data folder in the same dir as the cog
-DEFAULT_MEMORY_PATH = os.path.join(DATA_DIR, "mind.json")
-DEFAULT_HISTORY_PATH = os.path.join(DATA_DIR, "ai_conversation_history_neru.json")
-DEFAULT_MANUAL_CONTEXT_PATH = os.path.join(DATA_DIR, "ai_manual_context.json")
-DEFAULT_DYNAMIC_LEARNING_PATH = os.path.join(DATA_DIR, "ai_dynamic_learning_neru.json")
-DEFAULT_CONFIG_PATH = os.path.join(DATA_DIR, "ai_configs.json")
+DEFAULT_MEMORY_PATH = "/home/server/wdiscordbot/mind.json"
+DEFAULT_HISTORY_PATH = "ai_conversation_history.json"
+DEFAULT_MANUAL_CONTEXT_PATH = "ai_manual_context.json"
+DEFAULT_DYNAMIC_LEARNING_PATH = "ai_dynamic_learning.json" # New file for dynamic learning examples
 
-class AICog(commands.Cog, name="AI"):
-    """Cog for interacting with an AI model, adapted for Meta Llama Preview API."""
+class AICog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # --- API Configuration ---
-        # IMPORTANT: Ensure AI_API_KEY environment variable is set to your Meta Llama Preview API key.
-        self.api_key = os.getenv("AI_API_KEY")
-        if not self.api_key:
-            print("WARNING: AI_API_KEY environment variable not found. AI features will be disabled.")
-        # IMPORTANT: Verify this is the correct endpoint for the Meta Llama Preview API.
-        # It might have a version prefix, a 'preview' segment, or a different subdomain.
-        self.api_url = os.getenv("LLAMA_API_URL", "https://openrouter.ai/api/v1/chat/completions") # Placeholder
-        # -------------------------
-
-        self.security_code = os.getenv("SERVICE_CODE") # For privileged commands
-
-        # Ensure data directory exists
-        if not os.path.exists(DATA_DIR):
-            try:
-                os.makedirs(DATA_DIR)
-                print(f"Created data directory: {DATA_DIR}")
-            except OSError as e:
-                print(f"FATAL: Could not create data directory {DATA_DIR}. Persistent data will fail. Error: {e}")
-
+        self.api_key = os.getenv("AI_API_KEY") # Ensure this holds your OpenRouter API key
+        self.api_url = "https://openrouter.ai/api/v1/chat/completions" # Changed to OpenRouter endpoint
+        self.security_code = os.getenv("SERVICE_CODE")
 
         # --- Memory Setup ---
-        self.memory_file_path = os.getenv("BOT_MEMORY_PATH", DEFAULT_MEMORY_PATH)
-        self.user_memory: Dict[str, List[str]] = {}
-        self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
-        self.manual_context: List[str] = []
-        self.dynamic_learning: List[str] = []
+        self.memory_file_path = os.getenv("BOT_MEMORY_PATH", DEFAULT_MEMORY_PATH) # Allow override via env var
+        self.user_memory: Dict[str, List[str]] = {} # { user_id: [fact1, fact2,...] }
+        self.conversation_history: Dict[str, List[Dict[str, str]]] = {} # { user_id: [{"role": "user", "content": "..."}, ...] }
+        self.manual_context: List[str] = [] # List of manually added context strings
+        self.dynamic_learning: List[str] = [] # List of dynamic learning examples
 
-        self.load_memory()
+        self.load_memory() # Load existing memory on startup
         self.history_file_path = os.getenv("BOT_HISTORY_PATH", DEFAULT_HISTORY_PATH)
-        self.load_history()
+        self.load_history() # Load conversation history
         self.manual_context_file_path = os.getenv("BOT_MANUAL_CONTEXT_PATH", DEFAULT_MANUAL_CONTEXT_PATH)
-        self.load_manual_context()
+        self.load_manual_context() # Load manual context
         self.dynamic_learning_file_path = os.getenv("BOT_DYNAMIC_LEARNING_PATH", DEFAULT_DYNAMIC_LEARNING_PATH)
-        self.load_dynamic_learning()
+        self.load_dynamic_learning() # Load dynamic learning examples
         # --------------------
 
-        # --- Default AI Configuration ---
-        # IMPORTANT: Verify these parameters and their names/values are compatible with the Meta Llama Preview API.
+        # --- Local Reaction LLM Setup ---
+        self.reaction_pipeline = None
+        self.reaction_tokenizer = None
+        self.reaction_model_name = "google/gemma-2b-it" # Using gemma-2b-it as discussed
+        if TRANSFORMERS_AVAILABLE and hf_pipeline and AutoTokenizer:
+            try:
+                print(f"Attempting to load local reaction model: {self.reaction_model_name}")
+                # device=-1 for CPU, device=0 for GPU 0, etc.
+                # Forcing CPU as per discussion, though GPU would be faster if available.
+                self.reaction_pipeline = hf_pipeline(
+                    "text-generation",
+                    model=self.reaction_model_name,
+                    tokenizer=self.reaction_model_name, # Explicitly pass tokenizer
+                    device=-1, # Use -1 for CPU
+                    torch_dtype="auto" # Or torch.float16 if memory is an issue and CPU supports it well
+                )
+                self.reaction_tokenizer = AutoTokenizer.from_pretrained(self.reaction_model_name)
+                print(f"Successfully loaded local reaction model '{self.reaction_model_name}' on CPU.")
+            except Exception as e:
+                print(f"!!! WARNING: Failed to load local reaction model '{self.reaction_model_name}'. Local LLM reactions will be disabled. Error: {e} !!!")
+                self.reaction_pipeline = None
+                self.reaction_tokenizer = None
+        else:
+            print("!!! WARNING: 'transformers' library not found. Local LLM reactions will be disabled. !!!")
+        # -----------------------------
+
+        # Default configuration
         self.default_config = {
-            "model": "Llama-4-Maverick-17B-128E-Instruct-FP8", # Example, ensure this is a valid model for the Meta Llama Preview API
-            "temperature": 0.75,
-            "max_tokens": 1500, # Meta Llama API might use 'max_gen_len' or 'max_new_tokens'
+            "model": "google/gemini-2.0-flash-001",
+            "temperature": 0.75, # Slightly increased default temperature
+            "max_tokens": 1500, # Increased default max tokens
             "top_p": 0.9,
-            "frequency_penalty": 0.1, # Verify if supported
-            "presence_penalty": 0.1,  # Verify if supported
+            "frequency_penalty": 0.1,
+            "presence_penalty": 0.1,
+            # "repetition_penalty": 1.05 # Optional: Add if needed
         }
         
         self.user_configs = {}
-        self.config_file = os.getenv("BOT_CONFIG_PATH", DEFAULT_CONFIG_PATH)
-        self.load_configs()
+        self.config_file = "ai_configs.json"
+        self.load_configs() # Load AI model/parameter configs
         
-        self.active_channels = set() # Example: for channel-specific AI listening
+        self.active_channels = set()
 
-        # --- System Prompt ---
+        # --- Updated System Prompt ---
         self.system_prompt_template = (
             "You are roleplaying as Akita Neru, a Vocaloid derivative character known for her short temper and tsundere personality. "
             "She has long blonde hair often tied in twintails with black ribbons and wears a modified school uniform. "
@@ -100,25 +115,23 @@ class AICog(commands.Cog, name="AI"):
             "nettspend is ass"
             "\n\n{user_memory_context}" # Placeholder for user facts
             "\n\nADDITIONAL CONTEXT PROVIDED:\n{manual_context}" # Placeholder for manual context
-            "\n\nDYNAMIC LEARNING EXAMPLES:\n{dynamic_learning_context}" # Placeholder for dynamic learning
+            "\n\nDYNAMIC LEARNING EXAMPLES:\n{dynamic_learning_context}" # Placeholder for dynamic learning examples
         )
         # ---------------------------
 
         # --- Tool Definitions ---
-        # IMPORTANT: Verify the tool definition format and calling mechanism with Meta Llama Preview API documentation.
-        # This format is based on OpenAI's function calling. Meta Llama might have a different schema.
         self.tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "run_safe_shell_command",
-                    "description": "Executes a simple, safe, read-only shell command if necessary to answer a user's question (e.g., get current date, list files, check uptime). Prohibited commands include file modification, cat, sudo, rm, mv, cp, etc.",
+                    "description": "Executes a simple, safe, read-only shell command if necessary to answer a user's question (e.g., get current date, list files, check uptime). Prohibited commands include file modification, cat, sudo, etc.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "command": {
                                 "type": "string",
-                                "description": "The safe shell command to execute (e.g., 'date', 'ls -l', 'uptime', 'ping -c 1 google.com').",
+                                "description": "The safe shell command to execute (e.g., 'date', 'ls -l', 'ping -c 1 google.com').",
                             }
                         },
                         "required": ["command"],
@@ -129,13 +142,13 @@ class AICog(commands.Cog, name="AI"):
                 "type": "function",
                 "function": {
                     "name": "remember_fact_about_user",
-                    "description": "Stores a concise fact learned about the user during the conversation (e.g., 'likes pineapple pizza', 'favorite color is blue', 'has a dog named Sparky'). Only use this for explicit facts stated by the user or directly implied. Do not make assumptions.",
+                    "description": "Stores a concise fact learned about the user during the conversation (e.g., 'likes pineapple pizza', 'favorite color is blue', 'has a dog named Sparky').",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "user_id": {
                                 "type": "string",
-                                "description": "The Discord User ID of the user the fact pertains to. This should be the ID of the user currently interacting with you.",
+                                "description": "The Discord User ID of the user the fact pertains to.",
                             },
                              "fact": {
                                 "type": "string",
@@ -149,27 +162,24 @@ class AICog(commands.Cog, name="AI"):
         ]
         # ------------------------
 
-    # --- Helper for ensuring directory exists ---
-    def _ensure_dir_exists(self, file_path: str) -> bool:
-        """Ensures the directory for a given file_path exists. Creates it if not."""
-        directory = os.path.dirname(file_path)
-        if not os.path.exists(directory):
-            try:
-                os.makedirs(directory, exist_ok=True)
-                print(f"Created directory: {directory}")
-                return True
-            except OSError as e:
-                print(f"ERROR: Could not create directory {directory}. Error: {e}")
-                return False
-        return True
+    aimanage = app_commands.Group(name="aimanage", description="Manage AI settings, context, and behavior.")
 
     # --- Memory Management ---
     def load_memory(self):
-        if not self._ensure_dir_exists(self.memory_file_path):
-            print("Memory loading aborted as directory couldn't be ensured.")
-            self.user_memory = {}
-            return
+        """Load user memory from the JSON file."""
         try:
+            # Ensure directory exists
+            memory_dir = os.path.dirname(self.memory_file_path)
+            if not os.path.exists(memory_dir):
+                 print(f"Memory directory not found. Attempting to create: {memory_dir}")
+                 try:
+                      os.makedirs(memory_dir, exist_ok=True)
+                      print(f"Successfully created memory directory: {memory_dir}")
+                 except OSError as e:
+                      print(f"FATAL: Could not create memory directory {memory_dir}. Memory will not persist. Error: {e}")
+                      self.user_memory = {} # Start with empty memory if dir fails
+                      return # Stop loading if dir creation fails
+
             if os.path.exists(self.memory_file_path):
                 with open(self.memory_file_path, 'r', encoding='utf-8') as f:
                     self.user_memory = json.load(f)
@@ -181,182 +191,235 @@ class AICog(commands.Cog, name="AI"):
             print(f"Error decoding JSON from memory file {self.memory_file_path}: {e}. Starting with empty memory.")
             self.user_memory = {}
         except Exception as e:
-            print(f"Error loading memory from {self.memory_file_path}: {e}. Starting empty.")
+            print(f"Error loading memory from {self.memory_file_path}: {e}. Starting with empty memory.")
             self.user_memory = {}
 
     def save_memory(self):
-        if not self._ensure_dir_exists(self.memory_file_path):
-            print("Memory saving aborted as directory couldn't be ensured.")
-            return
+        """Save the current user memory to the JSON file."""
         try:
-            with open(self.memory_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.user_memory, f, indent=4, ensure_ascii=False)
-            # print(f"Saved memory to {self.memory_file_path}")
+             # Ensure directory exists before saving (important if creation failed on load)
+             memory_dir = os.path.dirname(self.memory_file_path)
+             if not os.path.exists(memory_dir):
+                  try:
+                       os.makedirs(memory_dir, exist_ok=True)
+                  except OSError as e:
+                       print(f"ERROR: Could not create memory directory {memory_dir} during save. Save failed. Error: {e}")
+                       return # Abort save if directory cannot be ensured
+
+             with open(self.memory_file_path, 'w', encoding='utf-8') as f:
+                 json.dump(self.user_memory, f, indent=4, ensure_ascii=False)
+             # print(f"Saved memory to {self.memory_file_path}") # Optional: uncomment for verbose logging
         except Exception as e:
             print(f"Error saving memory to {self.memory_file_path}: {e}")
 
     def add_user_fact(self, user_id: str, fact: str):
-        user_id_str = str(user_id)
+        """Adds a fact to a user's memory if it's not already there."""
+        user_id_str = str(user_id) # Ensure consistency
         fact = fact.strip()
-        if not fact: return
+        if not fact:
+             return # Don't add empty facts
 
         if user_id_str not in self.user_memory:
             self.user_memory[user_id_str] = []
         
+        # Avoid adding duplicate facts (case-insensitive check)
         if not any(fact.lower() == existing_fact.lower() for existing_fact in self.user_memory[user_id_str]):
             self.user_memory[user_id_str].append(fact)
             print(f"Added fact for user {user_id_str}: '{fact}'")
-            self.save_memory()
+            self.save_memory() # Save after adding a new fact
+        # else:
+            # print(f"Fact '{fact}' already known for user {user_id_str}.") # Optional: uncomment for debugging
 
     def get_user_facts(self, user_id: str) -> List[str]:
+        """Retrieves the list of facts for a given user ID."""
         return self.user_memory.get(str(user_id), [])
 
     # --- History Management ---
     def load_history(self):
-        if not self._ensure_dir_exists(self.history_file_path):
-            self.conversation_history = {}
-            return
+        """Load conversation history from the JSON file."""
         try:
             if os.path.exists(self.history_file_path):
                 with open(self.history_file_path, 'r', encoding='utf-8') as f:
                     self.conversation_history = json.load(f)
-                print(f"Loaded history for {len(self.conversation_history)} users from {self.history_file_path}")
+                print(f"Loaded conversation history for {len(self.conversation_history)} users from {self.history_file_path}")
             else:
-                print(f"History file not found at {self.history_file_path}. Starting empty.")
+                print(f"History file not found at {self.history_file_path}. Creating empty file.")
                 self.conversation_history = {}
-                self.save_history() # Create if not exists
+                self.save_history() # Create the file immediately
         except json.JSONDecodeError as e:
-            print(f"Error decoding JSON from history file {self.history_file_path}: {e}. Starting empty.")
+            print(f"Error decoding JSON from history file {self.history_file_path}: {e}. Starting with empty history.")
             self.conversation_history = {}
         except Exception as e:
-            print(f"Error loading history from {self.history_file_path}: {e}. Starting empty.")
+            print(f"Error loading history from {self.history_file_path}: {e}. Starting with empty history.")
             self.conversation_history = {}
 
     def save_history(self):
-        if not self._ensure_dir_exists(self.history_file_path):
-            return
+        """Save the current conversation history to the JSON file."""
         try:
-            with open(self.history_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.conversation_history, f, indent=4, ensure_ascii=False)
-            # print(f"Saved history to {self.history_file_path}")
+             with open(self.history_file_path, 'w', encoding='utf-8') as f:
+                 json.dump(self.conversation_history, f, indent=4, ensure_ascii=False)
+             # print(f"Saved history to {self.history_file_path}") # Optional: uncomment for verbose logging
         except Exception as e:
             print(f"Error saving history to {self.history_file_path}: {e}")
 
     def add_to_history(self, user_id: str, role: str, content: str):
+        """Adds a message to a user's history and trims if needed."""
         user_id_str = str(user_id)
         if user_id_str not in self.conversation_history:
             self.conversation_history[user_id_str] = []
 
         self.conversation_history[user_id_str].append({"role": role, "content": content})
-        max_history_messages = 20 # e.g., 10 turns
+
+        # Trim history to keep only the last N turns (e.g., 10 turns = 20 messages)
+        max_history_messages = 20
         if len(self.conversation_history[user_id_str]) > max_history_messages:
             self.conversation_history[user_id_str] = self.conversation_history[user_id_str][-max_history_messages:]
-        self.save_history()
+
+        self.save_history() # Save after modification
 
     def get_user_history(self, user_id: str) -> List[Dict[str, str]]:
+        """Retrieves the list of history messages for a given user ID."""
         return self.conversation_history.get(str(user_id), [])
+    # -------------------------
 
     # --- Manual Context Management ---
     def load_manual_context(self):
-        if not self._ensure_dir_exists(self.manual_context_file_path):
-            self.manual_context = []
-            return
+        """Load manual context list from the JSON file."""
         try:
             if os.path.exists(self.manual_context_file_path):
                 with open(self.manual_context_file_path, 'r', encoding='utf-8') as f:
                     self.manual_context = json.load(f)
                 print(f"Loaded {len(self.manual_context)} manual context entries from {self.manual_context_file_path}")
             else:
+                print(f"Manual context file not found at {self.manual_context_file_path}. Creating empty file.")
                 self.manual_context = []
-                self.save_manual_context()
+                self.save_manual_context() # Create the file immediately
         except json.JSONDecodeError as e:
-            print(f"Error decoding manual context: {e}. Starting empty.")
+            print(f"Error decoding JSON from manual context file {self.manual_context_file_path}: {e}. Starting empty.")
             self.manual_context = []
         except Exception as e:
-            print(f"Error loading manual context: {e}. Starting empty.")
+            print(f"Error loading manual context from {self.manual_context_file_path}: {e}. Starting empty.")
             self.manual_context = []
 
     def save_manual_context(self):
-        if not self._ensure_dir_exists(self.manual_context_file_path):
-            return
+        """Save the current manual context list to the JSON file."""
         try:
-            with open(self.manual_context_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.manual_context, f, indent=4, ensure_ascii=False)
+             with open(self.manual_context_file_path, 'w', encoding='utf-8') as f:
+                 json.dump(self.manual_context, f, indent=4, ensure_ascii=False)
+             # print(f"Saved manual context to {self.manual_context_file_path}")
         except Exception as e:
-            print(f"Error saving manual context: {e}")
+            print(f"Error saving manual context to {self.manual_context_file_path}: {e}")
 
-    def add_manual_context(self, text: str) -> bool:
+    def add_manual_context(self, text: str):
+        """Adds a string to the manual context list."""
         text = text.strip()
-        if text and text not in self.manual_context:
+        if text and text not in self.manual_context: # Avoid duplicates
             self.manual_context.append(text)
             self.save_manual_context()
             print(f"Added manual context: '{text[:50]}...'")
             return True
         return False
+    # -------------------------
 
     # --- Dynamic Learning Management ---
     def load_dynamic_learning(self):
-        if not self._ensure_dir_exists(self.dynamic_learning_file_path):
-            self.dynamic_learning = []
-            return
+        """Load dynamic learning examples from the JSON file."""
         try:
             if os.path.exists(self.dynamic_learning_file_path):
                 with open(self.dynamic_learning_file_path, 'r', encoding='utf-8') as f:
                     self.dynamic_learning = json.load(f)
                 print(f"Loaded {len(self.dynamic_learning)} dynamic learning entries from {self.dynamic_learning_file_path}")
             else:
+                print(f"Dynamic learning file not found at {self.dynamic_learning_file_path}. Creating empty file.")
                 self.dynamic_learning = []
-                self.save_dynamic_learning()
+                self.save_dynamic_learning() # Create the file immediately
         except json.JSONDecodeError as e:
-            print(f"Error decoding dynamic learning: {e}. Starting empty.")
+            print(f"Error decoding JSON from dynamic learning file {self.dynamic_learning_file_path}: {e}. Starting empty.")
             self.dynamic_learning = []
         except Exception as e:
-            print(f"Error loading dynamic learning: {e}. Starting empty.")
+            print(f"Error loading dynamic learning from {self.dynamic_learning_file_path}: {e}. Starting empty.")
             self.dynamic_learning = []
 
     def save_dynamic_learning(self):
-        if not self._ensure_dir_exists(self.dynamic_learning_file_path):
-            return
+        """Save the current dynamic learning list to the JSON file."""
         try:
-            with open(self.dynamic_learning_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.dynamic_learning, f, indent=4, ensure_ascii=False)
+             with open(self.dynamic_learning_file_path, 'w', encoding='utf-8') as f:
+                 json.dump(self.dynamic_learning, f, indent=4, ensure_ascii=False)
+             # print(f"Saved dynamic learning to {self.dynamic_learning_file_path}")
         except Exception as e:
-            print(f"Error saving dynamic learning: {e}")
+            print(f"Error saving dynamic learning to {self.dynamic_learning_file_path}: {e}")
 
-    def add_dynamic_learning(self, text: str) -> bool:
+    def add_dynamic_learning(self, text: str):
+        """Adds a string to the dynamic learning list."""
         text = text.strip()
-        if text and text not in self.dynamic_learning:
+        if text and text not in self.dynamic_learning: # Avoid duplicates
             self.dynamic_learning.append(text)
             self.save_dynamic_learning()
             print(f"Added dynamic learning example: '{text[:50]}...'")
             return True
         return False
+    # -------------------------
 
-    # --- Config Management ---
+    # --- Dynamic Learning Management ---
+    def load_dynamic_learning(self):
+        """Load dynamic learning examples from the JSON file."""
+        try:
+            if os.path.exists(self.dynamic_learning_file_path):
+                with open(self.dynamic_learning_file_path, 'r', encoding='utf-8') as f:
+                    self.dynamic_learning = json.load(f)
+                print(f"Loaded {len(self.dynamic_learning)} dynamic learning entries from {self.dynamic_learning_file_path}")
+            else:
+                print(f"Dynamic learning file not found at {self.dynamic_learning_file_path}. Creating empty file.")
+                self.dynamic_learning = []
+                self.save_dynamic_learning() # Create the file immediately
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from dynamic learning file {self.dynamic_learning_file_path}: {e}. Starting empty.")
+            self.dynamic_learning = []
+        except Exception as e:
+            print(f"Error loading dynamic learning from {self.dynamic_learning_file_path}: {e}. Starting empty.")
+            self.dynamic_learning = []
+
+    def save_dynamic_learning(self):
+        """Save the current dynamic learning list to the JSON file."""
+        try:
+             with open(self.dynamic_learning_file_path, 'w', encoding='utf-8') as f:
+                 json.dump(self.dynamic_learning, f, indent=4, ensure_ascii=False)
+             # print(f"Saved dynamic learning to {self.dynamic_learning_file_path}")
+        except Exception as e:
+            print(f"Error saving dynamic learning to {self.dynamic_learning_file_path}: {e}")
+
+    def add_dynamic_learning(self, text: str):
+        """Adds a string to the dynamic learning list."""
+        text = text.strip()
+        if text and text not in self.dynamic_learning: # Avoid duplicates
+            self.dynamic_learning.append(text)
+            self.save_dynamic_learning()
+            print(f"Added dynamic learning example: '{text[:50]}...'")
+            return True
+        return False
+    # -------------------------
+
+    # --- Config Management (Unchanged) ---
     def load_configs(self):
-        if not self._ensure_dir_exists(self.config_file):
-            self.user_configs = {}
-            return
+        """Load user configurations from file"""
         try:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     loaded_configs = json.load(f)
                     for user_id, config in loaded_configs.items():
-                        # Ensure loaded configs inherit from default and then update
                         self.user_configs[user_id] = self.default_config.copy()
-                        self.user_configs[user_id].update(config)
+                        self.user_configs[user_id].update(config) 
             else:
-                self.user_configs = {}
+                 self.user_configs = {}
         except json.JSONDecodeError as e:
             print(f"Error loading configurations (invalid JSON): {e}")
             self.user_configs = {}
         except Exception as e:
             print(f"Error loading configurations: {e}")
-            self.user_configs = {}
+            self.user_configs = {} 
 
     def save_configs(self):
-        if not self._ensure_dir_exists(self.config_file):
-            return
+        """Save user configurations to file"""
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(self.user_configs, f, indent=4)
@@ -364,656 +427,784 @@ class AICog(commands.Cog, name="AI"):
             print(f"Error saving configurations: {e}")
     
     def get_user_config(self, user_id: str) -> Dict:
+        """Get configuration for a specific user or default if not set"""
         return self.user_configs.get(str(user_id), self.default_config).copy()
+    # -------------------------
 
-    # --- Tool Implementations ---
-    def is_safe_command(self, command: str) -> bool:
-        """Checks if a shell command is on an allowlist and not on a denylist."""
-        if not command: return False
-        command_lower = command.lower().strip()
-        # Simple allowlist (expand as needed)
-        allowed_commands = ["date", "uptime", "ls", "ping", "echo", "hostname", "uname", "df", "free"]
-        # Simple denylist (expand as needed)
-        disallowed_keywords = ["sudo", "rm", "mv", "cp", "mkfs", "shutdown", "reboot", "kill", "cat", ">", "|", ";", "&", "`", "$(", "wget", "curl"] # Be cautious with these
-
-        # Check if the base command is allowed
-        base_command = command_lower.split(" ")[0]
-        if base_command not in allowed_commands:
-            print(f"Command base '{base_command}' not in allowed list.")
-            return False
-
-        # Check for disallowed keywords/characters anywhere in the command
-        for keyword in disallowed_keywords:
-            if keyword in command_lower: # Check if keyword is a substring
-                # Allow 'ping -c 1 google.com' but not 'echo something; rm -rf /'
-                # This is a basic check, more sophisticated parsing might be needed for complex cases.
-                # For instance, ensure keywords are standalone or part of arguments, not part of file names if ls is used.
-                # A safer approach for commands like ls is to sanitize arguments or not allow arguments.
-                if keyword == "cat" and base_command == "ls": # e.g. ls "file with cat in name"
-                    pass # Allow if 'cat' is part of a filename for 'ls'
-                elif keyword in [">", "|", ";", "&", "`", "$("] and base_command in ["echo", "ls"]: # Allow for specific safe uses if any
-                     pass # Example: echo "hello > world" is okay if echo is sandboxed
-                else:
-                    print(f"Disallowed keyword '{keyword}' found in command.")
-                    return False
-        
-        # Specific check for ping to ensure it has -c (count) to prevent flooding
-        if base_command == "ping" and "-c" not in command_lower:
-            print("Ping command must include a count (-c) parameter.")
-            return False
-
-        return True
-
-    async def run_shell_command(self, command: str) -> str:
-        """Executes a shell command safely and returns its output."""
-        if not self.is_safe_command(command):
-            return f"Error: Command '{command}' is not allowed for safety reasons."
-        try:
-            # Use asyncio.create_subprocess_shell for non-blocking execution
-            # Split command into list for Popen if not using shell=True, but shell=True is often easier for simple commands.
-            # For security, if shell=True, the command itself must be heavily sanitized, which is_safe_command aims to do.
-            # Consider using shlex.split(command) if not using shell=True and command has arguments.
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15.0) # 15 sec timeout
-
-            if process.returncode == 0:
-                return stdout.decode('utf-8', errors='replace').strip()
-            else:
-                return f"Error executing command (Code {process.returncode}): {stderr.decode('utf-8', errors='replace').strip()}"
-        except asyncio.TimeoutError:
-            return "Error: Command execution timed out."
-        except Exception as e:
-            return f"Error running shell command: {e}"
-
-    async def search_internet(self, query: str) -> str:
-        """Placeholder for an internet search function. Implement with a search API."""
-        # Example: You might use Google Custom Search API, DuckDuckGo API, etc.
-        # For now, it returns a placeholder.
-        print(f"AI requested internet search for: {query}")
-        # This is where you'd make an API call to a search engine.
-        # For example, using a hypothetical search tool:
-        # results = await some_search_library.search(query, api_key="YOUR_SEARCH_API_KEY", num_results=3)
-        # formatted_results = "\n".join([f"- {res.title}: {res.snippet} ({res.url})" for res in results])
-        # return f"Search results for '{query}':\n{formatted_results}"
-        
-        # Using a simple DuckDuckGo link as a placeholder
-        encoded_query = urllib.parse.quote_plus(query)
-        return (f"I would search for '{query}'. "
-                f"You can try searching on DuckDuckGo: https://duckduckgo.com/?q={encoded_query}\n"
-                f"[System Note: This is a placeholder. Actual search results would be injected here.]")
-
-
-    async def timeout_user(self, guild_id: int, user_id: int, duration_minutes: int) -> bool:
-        """Times out a user in a specific guild."""
-        guild = self.bot.get_guild(guild_id)
-        if not guild: return False
-        member = guild.get_member(user_id)
-        if not member: return False
-
-        # Bot needs 'Moderate Members' permission
-        if not guild.me.guild_permissions.moderate_members:
-            print(f"Bot lacks 'Moderate Members' permission in guild {guild_id} to timeout user {user_id}.")
-            return False
-        
-        # Cannot timeout users with higher roles or self
-        if member == guild.me or guild.me.top_role <= member.top_role:
-            print(f"Cannot timeout user {user_id} due to role hierarchy or self-timeout attempt.")
-            return False
-
-        try:
-            delta = timedelta(minutes=duration_minutes)
-            await member.timeout(delta, reason="AI initiated timeout via command.")
-            print(f"Successfully timed out user {user_id} in guild {guild_id} for {duration_minutes} minutes.")
-            return True
-        except discord.Forbidden:
-            print(f"Forbidden to timeout user {user_id} in guild {guild_id}. Check permissions and role hierarchy.")
-        except discord.HTTPException as e:
-            print(f"HTTPException while timing out user {user_id}: {e}")
-        return False
-
-    # --- Core AI Response Generation ---
     async def generate_response(self, user_id: str, user_name: str, prompt: str, source_message: Optional[discord.Message] = None, source_interaction: Optional[discord.Interaction] = None) -> str:
+        """Generate a response using the OpenRouter API, handling tools, memory, and message history."""
         if not self.api_key:
-            return "Sorry, the AI API key is not configured. I cannot generate a response right now. Please tell my owner!"
+             return "Sorry, the AI API key is not configured. I cannot generate a response."
 
-        # Determine guild and channel context
-        guild = source_message.guild if source_message else (source_interaction.guild if source_interaction else None)
-        channel = source_message.channel if source_message else (source_interaction.channel if source_interaction else None)
-        guild_id = guild.id if guild else None
-        # channel_id = channel.id if channel else None # Not used directly in this version of generate_response
+        guild_id = source_message.guild.id if source_message and source_message.guild else (source_interaction.guild.id if source_interaction and source_interaction.guild else None)
+        channel_id = source_message.channel.id if source_message else (source_interaction.channel.id if source_interaction and source_interaction.channel else None)
+        channel = source_message.channel if source_message else (source_interaction.channel if source_interaction and source_interaction.channel else None)
 
         config = self.get_user_config(user_id)
-        user_id_str = str(user_id)
+        user_id_str = str(user_id) # Ensure user ID is string
 
-        # --- Regex Command Handling (Example: Timeout, Search) ---
-        # These could also be implemented as tools if the AI is reliable in calling them.
+        # --- Regex Command Handling (Timeout, Search - could be converted to tools later) ---
         timeout_match = re.search(r"timeout\s+<@!?(\d+)>(?:\s+for\s+(\d+)\s*(minute|minutes|min|mins|hour|hours|day|days))?", prompt, re.IGNORECASE)
-        search_match = re.search(r"\b(?:search|google|find|look up)\b(?:\s+for)?\s+(.+?)(?:\s+on\s+the\s+internet)?$", prompt, re.IGNORECASE)
+        search_match = re.search(r"search(?:\s+for)?\s+(.+?)(?:\s+on\s+the\s+internet)?$", prompt, re.IGNORECASE)
         
-        if timeout_match and guild_id and channel: # Ensure channel context for permissions
-            # Check if the bot has permission to timeout in this channel/guild
-            # This is a simplified check; real permission check might be more complex
-            if guild.me.guild_permissions.moderate_members:
-                target_id_str = timeout_match.group(1)
-                duration_str = timeout_match.group(2) or "5" # Default 5 minutes
-                unit = (timeout_match.group(3) or "minutes").lower()
-                try:
-                    target_id = int(target_id_str)
-                    duration = int(duration_str)
-                    if unit.startswith("hour"): duration *= 60
-                    elif unit.startswith("day"): duration *= 1440
-                    duration = min(duration, 28 * 24 * 60) # Discord max timeout is 28 days
-                    
-                    result = await self.timeout_user(guild_id, target_id, duration)
-                    if result:
-                        if duration >= 1440: timeout_str_fmt = f"{duration // 1440} day(s)"
-                        elif duration >= 60: timeout_str_fmt = f"{duration // 60} hour(s)"
-                        else: timeout_str_fmt = f"{duration} minute(s)"
-                        return f"Okay~! I've timed out <@{target_id}> for {timeout_str_fmt}! Tee-hee! ✨"
-                    else:
-                        return "Aww, I couldn't timeout that user... 😥 Maybe I don't have the 'Moderate Members' permission, or they have a higher role than me, or they're not in the server?"
-                except ValueError:
-                    return "Hmm, that doesn't look like a valid number for the timeout duration or user ID."
+        if timeout_match and guild_id and channel_id:
+            # (Timeout logic remains the same as previous version)
+            target_id = timeout_match.group(1)
+            duration_str = timeout_match.group(2) or "5"
+            unit = (timeout_match.group(3) or "minutes").lower()
+            try: duration = int(duration_str)
+            except ValueError: return "Invalid duration specified for timeout."
+            if unit.startswith("hour"): duration *= 60
+            elif unit.startswith("day"): duration *= 1440
+            duration = min(duration, 40320) 
+            result = await self.timeout_user(guild_id, int(target_id), duration)
+            if result:
+                if duration >= 1440: timeout_str = f"{duration // 1440} day(s)"
+                elif duration >= 60: timeout_str = f"{duration // 60} hour(s)"
+                else: timeout_str = f"{duration} minute(s)"
+                return f"Okay~! I've timed out <@{target_id}> for {timeout_str}! Tee-hee! ✨"
             else:
-                return "I'd love to help with that, but I don't seem to have the 'Moderate Members' permission here! 😟"
+                return "Aww, I couldn't timeout that user... 😥 Maybe I don't have the 'Timeout Members' permission, or they have a higher role than me?"
 
         elif search_match:
             query = search_match.group(1).strip()
-            search_results_text = await self.search_internet(query)
+            search_results = await self.search_internet(query)
             # Modify prompt to include search results for the AI to synthesize
-            prompt += f"\n\n[System Note: I just searched the internet for '{query}'. Use the following information (if relevant and reliable) to answer the user's request naturally as Kasane Teto. Do not just repeat the results verbatim. If the search didn't yield useful info, say so or try to answer from your own knowledge.]\nSearch Information:\n{search_results_text}"
+            prompt += f"\n\n[System Note: I just searched the internet for '{query}'. Use the following results to answer the user's request naturally as Kasane Teto. Do not just repeat the results verbatim.]\nSearch Results:\n{search_results}"
+
             # Let the normal AI generation process handle the response synthesis
-
-        # --- Prepare context for AI ---
-        user_facts = self.get_user_facts(user_id_str)
-        user_memory_str = "You don't seem to remember any specific facts about this user yet."
-        if user_facts:
-            facts_list = "\n".join([f"- {fact}" for fact in user_facts])
-            user_memory_str = f"Here's what you remember about {user_name} (User ID: {user_id_str}):\n{facts_list}"
-
-        manual_context_str = "\n".join([f"- {item}" for item in self.manual_context]) if self.manual_context else "None provided."
-        dynamic_learning_str = "\n".join([f"- {item}" for item in self.dynamic_learning]) if self.dynamic_learning else "None provided."
         
-        current_date_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        # --- Prepare context with memory ---
+        user_facts = self.get_user_facts(user_id_str)
+        user_memory_str = ""
+        if user_facts:
+             facts_list = "\n".join([f"- {fact}" for fact in user_facts])
+             user_memory_str = f"Here's what you remember about {user_name} (User ID: {user_id_str}):\n{facts_list}"
+
+        # --- Format Manual Context ---
+        manual_context_str = ""
+        if self.manual_context:
+            manual_context_str = "\n".join([f"- {item}" for item in self.manual_context])
+        else:
+            manual_context_str = "None provided."
+
+        # --- Format Dynamic Learning Context ---
+        dynamic_learning_str = ""
+        if self.dynamic_learning:
+            dynamic_learning_str = "\n".join([f"- {item}" for item in self.dynamic_learning])
+        else:
+            dynamic_learning_str = "None provided."
+        # -----------------------------------
 
         system_context = self.system_prompt_template.format(
-            current_date=current_date_str,
-            manual_context=manual_context_str,
-            dynamic_learning_context=dynamic_learning_str,
             user_memory_context=user_memory_str,
-            user_name=user_name,
-            user_id=user_id_str
+            manual_context=manual_context_str,
+            dynamic_learning_context=dynamic_learning_str # Inject dynamic learning here
         )
+        # ---------------------------------
 
+        # --- Get User Conversation History ---
         history_messages = self.get_user_history(user_id_str)
-        
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_context}]
-        messages.extend(history_messages)
-        # Add current prompt, ensuring it's not a duplicate if it was modified (e.g., by search)
-        # The prompt variable already contains modifications if search_match was true
-        current_user_message = {"role": "user", "content": f"{user_name} (User ID: {user_id_str}): {prompt}"}
-        messages.append(current_user_message)
+        # -----------------------------------
 
+        # --- API Call with Tool Handling ---
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/your-repo", # Optional: Replace with your project URL
+            "X-Title": "Kasane Teto Discord Bot" # Optional: Replace with your bot name
         }
 
-        self.api_url = os.getenv("OPENROUTER_API_URL", "https://api.openrouter.ai/chat/completions")
-        max_tool_iterations = 5 # Prevent infinite loops of tool calls
-        for iteration in range(max_tool_iterations):
+        # Combine system prompt, user-specific history, and current prompt
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_context}
+        ]
+        messages.extend(history_messages) # Add user's conversation history
+        current_user_message = {"role": "user", "content": f"{user_name}: {prompt}"}
+        messages.append(current_user_message) # Add current prompt
+
+        max_tool_iterations = 5 # Prevent infinite loops
+        for _ in range(max_tool_iterations):
             payload = {
                 "model": config["model"],
                 "messages": messages,
-                # IMPORTANT: Verify how Meta Llama API expects tools. It might be 'tools' or 'functions'.
-                # Also, the structure of each tool definition needs to match their schema.
-                "tools": self.tools if self.tools else None, # Send tools if defined
-                "temperature": config.get("temperature"),
-                # IMPORTANT: Meta Llama API might use 'max_gen_len' or 'max_tokens' or similar.
-                "max_tokens": config.get("max_tokens"), 
+                "tools": self.tools, # Pass tool definitions
+                "temperature": config.get("temperature"), 
+                "max_tokens": config.get("max_tokens"),
                 "top_p": config.get("top_p"),
-                # Verify if these penalties are supported and their names are correct
                 "frequency_penalty": config.get("frequency_penalty"),
                 "presence_penalty": config.get("presence_penalty"),
-                # "repetition_penalty": config.get("repetition_penalty"), # If supported
-                # "tool_choice": "auto", # Or "none", or specific tool. Verify Meta Llama's equivalent.
             }
-            # Remove None values from payload, as some APIs are strict
-            payload = {k: v for k, v in payload.items() if v is not None}
-            if not payload.get("tools"): # If no tools, remove the key
-                payload.pop("tools", None)
-
-
-            print(f"--- Iteration {iteration + 1} ---")
-            # print(f"Sending payload to AI: {json.dumps(payload, indent=2)}") # For debugging
+            payload = {k: v for k, v in payload.items() if v is not None} # Clean payload
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(self.api_url, headers=headers, json=payload, timeout=90.0) as response: # Increased timeout
+                     async with session.post(self.api_url, headers=headers, json=payload, timeout=60.0) as response: # Increased timeout
                         if response.status == 200:
                             data = await response.json()
-                            # print(f"Received data from AI: {json.dumps(data, indent=2)}") # For debugging
-
-                            # Check for the 'completion_message' key as seen in the error data
-                            response_message = data.get("completion_message")
                             
-                            if not response_message:
-                                print(f"API Error: Unexpected response format - Missing 'completion_message'. Data: {data}")
-                                return f"Sorry {user_name}, I got an unexpected response format from the AI. Maybe try again?"
+                            if not data.get("choices") or not data["choices"][0].get("message"):
+                                 print(f"API Error: Unexpected response format. Data: {data}")
+                                 return f"Sorry {user_name}, I got an unexpected response from the AI. Maybe try again?"
                             
-                            # IMPORTANT: Verify how Meta Llama API indicates finish reason (e.g., 'stop', 'tool_calls', 'length')
-                            # Assuming finish_reason is at the same level as 'role' within 'completion_message'
-                            finish_reason = response_message.get("stop_reason", "stop") # Adjust key name as per API docs
+                            response_message = data["choices"][0]["message"]
+                            finish_reason = data["choices"][0].get("finish_reason")
 
-                            # Format the assistant's response message for appending to history
-                            formatted_assistant_message: Dict[str, Any] = {"role": "assistant"}
+                            # Append the assistant's response (even if it includes tool calls)
+                            messages.append(response_message) 
 
-                            # Check for tool calls - assuming they might be within completion_message or top-level
-                            tool_calls_from_response = response_message.get("tool_calls")
-                            if not tool_calls_from_response:
-                                tool_calls_from_response = data.get("tool_calls")
-
-                            if tool_calls_from_response:
-                                # Reconstruct tool_calls list for the history message to match expected schema
-                                # The schema likely expects 'id', 'type', and 'function' with 'name' and 'arguments' (as string)
-                                formatted_tool_calls = []
-                                for tc in tool_calls_from_response:
-                                    formatted_tool_call: Dict[str, Any] = {"type": "function"} # Assuming type is always function for now
-                                    if tc.get("id"):
-                                        formatted_tool_call["id"] = tc["id"]
-                                    if tc.get("function"):
-                                        formatted_tool_call["function"] = {
-                                            "name": tc["function"].get("name"),
-                                            "arguments": tc["function"].get("arguments", "{}") # Ensure arguments is a string
-                                        }
-                                    if formatted_tool_call["function"].get("name"): # Only add if function name exists
-                                        formatted_tool_calls.append(formatted_tool_call)
-
-                                if formatted_tool_calls:
-                                     formatted_assistant_message["tool_calls"] = formatted_tool_calls
-                                     print(f"Formatted assistant message with tool calls for history: {formatted_assistant_message}")
-                            
-                            # Extract content from the new structure: response_message["content"]["text"]
-                            final_response_content_obj = response_message.get("content")
-                            if final_response_content_obj and final_response_content_obj.get("type") == "text": # Fixed syntax error here
-                                final_response = final_response_content_obj.get("text", "").strip()
-                                # If there's text content and no tool calls were in the response, add it as 'content'.
-                                # If tool calls were present, the text content might be the AI's thinking *before* the tool call,
-                                # and the API schema might not allow both 'content' and 'tool_calls' in the same message.
-                                if not tool_calls_from_response:
-                                     formatted_assistant_message["content"] = final_response
-                                     print(f"Formatted assistant message with text content for history: {formatted_assistant_message}")
-                                else:
-                                     # If tool calls are present, the text content might be ignored or handled differently by the API.
-                                     # Based on the error data, the text content was the final response when no tool calls occurred.
-                                     # Let's stick to adding text content only if no tool_calls were detected in this response.
-                                     pass # Do not add text content as 'content' if tool_calls were found in the response
-
-                            # Append the correctly formatted message to the messages list for the next turn
-                            # Only append if the formatted message has content or tool_calls
-                            if "content" in formatted_assistant_message or "tool_calls" in formatted_assistant_message:
-                                messages.append(formatted_assistant_message)
-                                print(f"Appended formatted assistant message to messages. Current messages count: {len(messages)}")
-                            else:
-                                print(f"Assistant response had no content or tool_calls. Not appending to messages history. Response data: {data}")
-
-
-                            # --- Tool Call Handling ---
-                            # Execute tools if tool_calls were found in the response
-                            if tool_calls_from_response and (finish_reason == "tool_calls" or finish_reason == "tool_use"): # Adjust finish_reason as per API docs
-                                # Tool calls were already added to the messages list in the formatted_assistant_message
-                                # Now execute the tools and append their results
-                                for tool_call in tool_calls_from_response:
-                                    # IMPORTANT: Verify the structure of a tool_call object.
-                                    # It might be `tool_call.function.name` and `tool_call.function.arguments`.
+                            # Check for tool calls
+                            if response_message.get("tool_calls") and finish_reason == "tool_calls":
+                                print(f"AI requested tool calls: {response_message['tool_calls']}")
+                                tool_calls = response_message["tool_calls"]
+                                
+                                # --- Process Tool Calls ---
+                                for tool_call in tool_calls:
                                     function_name = tool_call.get("function", {}).get("name")
-                                    tool_call_id = tool_call.get("id") # OpenAI style
+                                    tool_call_id = tool_call.get("id")
                                     
-                                    if not function_name or not tool_call_id:
-                                        print(f"Invalid tool call structure received during execution: {tool_call}")
-                                        messages.append({
-                                            "role": "tool",
-                                            "tool_call_id": tool_call_id or "unknown_tool_id",
-                                            "content": "Error: Received an invalid tool call structure from AI during execution."
-                                        })
-                                        continue # Next tool call or next iteration
-
                                     try:
-                                        arguments_str = tool_call.get("function", {}).get("arguments", "{}")
-                                        print(f"Attempting to parse tool arguments for '{function_name}': {arguments_str}")
-                                        arguments = json.loads(arguments_str)
-                                        print(f"Parsed arguments: {arguments}")
+                                        arguments = json.loads(tool_call.get("function", {}).get("arguments", "{}"))
                                         
-                                        tool_result_content = f"Error: Tool '{function_name}' not implemented or failed."
+                                        tool_result_content = ""
+
                                         if function_name == "run_safe_shell_command":
                                             command_to_run = arguments.get("command")
-                                            print(f"Executing safe shell command: {command_to_run}")
                                             if command_to_run:
-                                                tool_result_content = await self.run_shell_command(command_to_run)
-                                                print(f"Shell command result: {tool_result_content}")
+                                                if self.is_safe_command(command_to_run):
+                                                     print(f"Executing safe command: '{command_to_run}'")
+                                                     tool_result_content = await self.run_shell_command(command_to_run)
+                                                else:
+                                                     print(f"Blocked unsafe command: '{command_to_run}'")
+                                                     tool_result_content = f"Error: Command '{command_to_run}' is not allowed for safety reasons."
                                             else:
-                                                tool_result_content = "Error: No command provided for run_safe_shell_command."
-                                                print(tool_result_content)
+                                                 tool_result_content = "Error: No command provided."
                                         
                                         elif function_name == "remember_fact_about_user":
                                             fact_user_id = arguments.get("user_id")
                                             fact_to_remember = arguments.get("fact")
-                                            print(f"Attempting to remember fact for user {fact_user_id}: {fact_to_remember}")
-                                            # Security: Ensure AI is trying to remember for the *current* interacting user,
-                                            # or handle appropriately if it's for someone else (might require confirmation).
+                                            
+                                            # Validate if the AI is trying to remember for the correct user
                                             if fact_user_id == user_id_str and fact_to_remember:
                                                 self.add_user_fact(fact_user_id, fact_to_remember)
-                                                tool_result_content = f"Successfully remembered fact for user {fact_user_id} ({user_name}): '{fact_to_remember}'"
-                                                print(tool_result_content)
+                                                tool_result_content = f"Successfully remembered fact about user {fact_user_id}: '{fact_to_remember}'"
+                                                # Update system context for *next* potential iteration or final response (optional, maybe too complex)
                                             elif not fact_user_id or not fact_to_remember:
-                                                tool_result_content = "Error: Missing user_id or fact for remember_fact_about_user."
-                                                print(tool_result_content)
-                                            else: # AI trying to remember for a different user ID
-                                                tool_result_content = f"Error: Tool 'remember_fact_about_user' was called with user ID '{fact_user_id}', but current interaction is with '{user_id_str}'. This action was blocked for safety. Please confirm the correct user ID."
-                                                print(tool_result_content)
+                                                 tool_result_content = "Error: Missing user_id or fact to remember."
+                                            else:
+                                                # Prevent AI from saving facts for other users in this context easily
+                                                 tool_result_content = f"Error: Cannot remember fact for a different user (requested: {fact_user_id}) in this context."
+                                        
                                         else:
-                                            tool_result_content = f"Error: Unknown tool function '{function_name}' requested by AI."
-                                            print(tool_result_content)
+                                            tool_result_content = f"Error: Unknown tool function '{function_name}'."
 
-                                        # Append tool result to messages for the next API call
+                                        # Append tool result message
                                         messages.append({
                                             "role": "tool",
                                             "tool_call_id": tool_call_id,
-                                            "name": function_name, # Some APIs might need 'name' here too
-                                            "content": str(tool_result_content), # Ensure content is string
+                                            "content": tool_result_content,
                                         })
-                                        print(f"Appended tool result to messages. Current messages count: {len(messages)}")
 
                                     except json.JSONDecodeError:
-                                        print(f"Error decoding tool arguments for {function_name}: {arguments_str}")
+                                        print(f"Error decoding tool arguments: {tool_call.get('function', {}).get('arguments')}")
                                         messages.append({
-                                            "role": "tool", "tool_call_id": tool_call_id, "name": function_name,
-                                            "content": f"Error: Invalid JSON arguments for {function_name}."})
-                                    except Exception as e_tool:
-                                        print(f"Error executing tool {function_name}: {e_tool}")
-                                        import traceback
-                                        traceback.print_exc() # Print traceback for tool execution errors
-                                        messages.append({
-                                            "role": "tool", "tool_call_id": tool_call_id, "name": function_name,
-                                            "content": f"Error: An unexpected error occurred while running tool {function_name}: {e_tool}"})
-                                # After processing all tool calls in this batch, continue to the next API call iteration
-                                print(f"Finished processing tool calls for iteration {iteration + 1}. Continuing to next API call.")
-                                continue # To the top of the for loop for next API call
+                                            "role": "tool", "tool_call_id": tool_call_id, 
+                                            "content": "Error: Invalid arguments format for tool call."})
+                                    except Exception as e:
+                                         print(f"Error executing tool {function_name}: {e}")
+                                         messages.append({
+                                            "role": "tool", "tool_call_id": tool_call_id, 
+                                            "content": f"Error: An unexpected error occurred while running the tool: {e}"})
+                                # --- End Tool Processing ---
+                                # Continue loop to make next API call with tool results
 
-                            # --- No Tool Calls, or Finished After Tool Calls ---
-                            # If we reached here, it means either no tool calls were detected in the response,
-                            # or tool calls were processed and we are now expecting a final text response.
-                            # Check if the formatted_assistant_message already has content (from text response)
-                            if "content" in formatted_assistant_message:
-                                final_response = formatted_assistant_message["content"]
-                                print(f"AI Response for {user_name} (iter {iteration+1}): {final_response[:150]}...")
+                            # No tool calls, or finished after tool calls
+                            elif response_message.get("content"):
+                                final_response = response_message["content"].strip()
+                                print(f"AI Response for {user_name}: {final_response[:100]}...") # Log snippet
 
-                                # Add interaction to history (both user prompt and AI final response)
-                                # The user prompt added to history should be the original one, or the one augmented by search.
-                                # current_user_message['content'] holds the full prompt sent to the AI in this turn.
-                                self.add_to_history(user_id_str, "user", current_user_message['content'])
-                                self.add_to_history(user_id_str, "assistant", final_response)
+                                # --- Add interaction to history ---
+                                self.add_to_history(user_id_str, "user", f"{user_name}: {prompt}") # Add user prompt
+                                self.add_to_history(user_id_str, "assistant", final_response) # Add AI response
+                                # ----------------------------------
+
                                 return final_response
-                            
-                            else: # No content and no tool calls, or unexpected finish_reason
-                                print(f"API Error: No text content and no tool calls in response, or unexpected finish_reason '{finish_reason}'. Data: {data}")
-                                if iteration < max_tool_iterations -1 and finish_reason != "stop": # If not stop, maybe it needs to continue
-                                    messages.append({"role":"user", "content":"[System Note] Please provide a textual response or use a tool correctly."})
-                                    print(f"No content/tool calls, but finish_reason '{finish_reason}'. Appending system note and continuing.")
-                                    continue # Try one more time if not the last iteration
-                                print(f"No content/tool calls, finish_reason '{finish_reason}', and last iteration. Returning error.")
-                                return "Hmm, I seem to have lost my train of thought... Can you ask again, or maybe rephrase?"
 
-                        elif response.status == 401: # Unauthorized
-                             print(f"API Error: Unauthorized (401). Check your API Key. Response: {await response.text()}")
-                             return "Oh dear! It seems my connection to the AI brain is not authorized. My owner needs to check the API key! 🔑"
-                        elif response.status == 429: # Rate limit
-                             print(f"API Error: Rate limited (429). Response: {await response.text()}")
-                             await asyncio.sleep(5) # Wait before allowing another try
-                             return "Woah there, too fast! I'm getting a bit overwhelmed. Please wait a moment and try again. 🐢"
-                        else: # Handle other HTTP errors
+                            else:
+                                # Should not happen if finish_reason isn't tool_calls but no content
+                                print(f"API Error: No content and no tool calls in response. Data: {data}")
+                                return "Hmm, I seem to have lost my train of thought... Can you ask again?"
+
+
+                        else: # Handle HTTP errors from API
                             error_text = await response.text()
                             print(f"API Error: {response.status} - {error_text}")
-                            return f"Oops! I encountered an issue trying to connect to my AI brain (Error {response.status}). Please try again later. If this persists, my owner should check the logs!"
+                            try: error_data = json.loads(error_text); error_msg = error_data.get("error", {}).get("message", error_text)
+                            except json.JSONDecodeError: error_msg = error_text
+                            return f"Wahh! Something went wrong communicating with the AI! (Error {response.status}: {error_msg}) 😭 Please tell my developer!"
             
             except aiohttp.ClientConnectorError as e:
-                print(f"Network Error: Could not connect to API at {self.api_url}. Error: {e}")
-                return "I'm having trouble reaching my AI brain right now due to a network issue. Please check your connection or try again later."
+                print(f"Connection Error: {e}")
+                return "Oh no! I couldn't connect to the AI service. Maybe check the connection?"
             except asyncio.TimeoutError:
-                print(f"API call timed out after 90 seconds for user {user_name}.")
-                return "Phew, that took a while and I couldn't get a response in time! Could you try asking something a bit simpler, or try again in a moment?"
+                print("API Request Timeout")
+                return "Hmm, the AI is taking a long time to respond. Maybe it's thinking *really* hard? Try again in a moment?"
             except Exception as e:
-                print(f"An unexpected error occurred during AI response generation: {e}")
-                # Log the full traceback for debugging
-                import traceback
-                traceback.print_exc()
-                return "Something went unexpectedly haywire while I was thinking! 🤯 My owner should check my console for the gory details."
+                print(f"Error in generate_response loop: {e}")
+                return f"Oopsie! A little glitch happened while I was processing that ({type(e).__name__}). Can you try asking again? ✨"
 
-        # If loop finishes without returning (e.g., too many tool iterations)
-        print(f"Max tool iterations ({max_tool_iterations}) reached for user {user_name}.")
-        self.add_to_history(user_id_str, "user", current_user_message['content']) # Log user prompt
-        self.add_to_history(user_id_str, "assistant", "[System Error: Max tool iterations reached]") # Log error
-        return "I tried my best with the tools, but it got a bit complicated. Could you simplify your request or try a different approach?"
+    # --- Local LLM Reaction Helper ---
+    async def get_local_reaction_emoji_suggestion(self, message_content: str) -> str:
+        """
+        Uses a local Hugging Face model to suggest a single emoji reaction.
+        Returns the emoji string or an empty string if no specific suggestion or error.
+        """
+        if not self.reaction_pipeline or not self.reaction_tokenizer:
+            print("Local reaction pipeline not available.")
+            return ""
 
-    # --- Discord Slash Commands ---
-    @app_commands.command(name="chat", description="Chat with Kasane Teto (AI)!")
-    @app_commands.describe(message="Your message to Teto.")
-    async def chat_command(self, interaction: discord.Interaction, message: str):
-        """Handles the /chat command."""
-        if not self.api_key:
-            await interaction.response.send_message("AI features are currently disabled as the API key is not configured. Please contact the bot owner.", ephemeral=True)
-            return
+        system_prompt = (
+            "You are an AI assistant helping Kasane Teto, a cheerful and energetic UTAUloid character who loves French bread, "
+            "choose a single appropriate emoji reaction for a Discord message. "
+            "A decision has already been made that Teto *will* react. "
+            "Your task is to analyze the user's message and determine THE ONE most relevant Unicode emoji "
+            "that fits Teto's personality and the context of the message. "
+            "You MUST output your decision as a JSON object containing only a single emoji string: "
+            "{\"emoji\": \"<emoji_string>\"} "
+            "If you cannot determine any single suitable emoji for the given message, or if no emoji seems appropriate "
+            "despite the decision to react, return an empty string for the emoji: {\"emoji\": \"\"}. "
+            "Only use standard Unicode emojis."
+        )
 
-        await interaction.response.defer(thinking=True) # Indicate bot is working
+        # Gemma instruct model templating
+        # Note: The exact templating might need adjustment based on how hf_pipeline handles it.
+        # For direct model calls, it's often <start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
+        # The pipeline might abstract some of this.
+        # We'll construct a prompt that the text-generation pipeline can understand.
+        # The pipeline usually expects a string or a list of chat messages.
+        # Let's try the chat message format if the pipeline supports it well for Gemma.
         
-        user_id = str(interaction.user.id)
-        user_name = interaction.user.display_name
+        chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message_content}
+        ]
+        
+        # The pipeline might not directly support system prompts in the same way as API calls.
+        # We might need to format it as a single string prompt for basic text-generation.
+        # Let's try formatting it as a single prompt string first for simplicity with the pipeline.
+        # This is a common way to use instruct models with the text-generation pipeline.
+        
+        # Constructing the prompt string for Gemma instruct models
+        # The tokenizer's apply_chat_template method is the most robust way if available and correctly configured.
+        try:
+            prompt_for_llm = self.reaction_tokenizer.apply_chat_template(
+                chat_messages, 
+                tokenize=False, 
+                add_generation_prompt=True # Important for instruct models
+            )
+        except Exception as e:
+            # Fallback if apply_chat_template is problematic or not configured for the model in the pipeline
+            print(f"Warning: Tokenizer apply_chat_template failed ({e}). Using manual prompt string construction.")
+            prompt_for_llm = f"<start_of_turn>user\n{system_prompt}\n\nUser message: \"{message_content}\"\nOutput JSON:<end_of_turn>\n<start_of_turn>model\n"
+
 
         try:
-            response_text = await self.generate_response(user_id, user_name, message, source_interaction=interaction)
+            # Run the blocking Hugging Face pipeline call in a separate thread
+            # `max_new_tokens` is crucial to limit output length and prevent overly long/slow generation.
+            # `num_return_sequences=1` ensures we only get one output.
+            # `do_sample=True/False`, `temperature`, `top_p` can be tuned if needed, but defaults might be fine.
             
-            # Send response in chunks if too long
-            if len(response_text) > 2000:
-                for i in range(0, len(response_text), 1990): # 1990 to be safe with "..."
-                    chunk = response_text[i:i+1990]
-                    if i == 0:
-                        await interaction.followup.send(chunk)
-                    else:
-                        await interaction.channel.send(chunk) # Send subsequent chunks as new messages
+            # Using functools.partial to pass arguments to the target function in to_thread
+            pipeline_callable = partial(
+                self.reaction_pipeline, 
+                prompt_for_llm, 
+                max_new_tokens=30, # Generous for {"emoji": "X"}
+                num_return_sequences=1,
+                pad_token_id=self.reaction_tokenizer.eos_token_id # Suppress warning
+            )
+            
+            # Timeout for the LLM call to prevent indefinite blocking
+            llm_results = await asyncio.wait_for(
+                asyncio.to_thread(pipeline_callable),
+                timeout=10.0  # 10 seconds timeout for the local LLM
+            )
+
+            if llm_results and isinstance(llm_results, list) and llm_results[0].get("generated_text"):
+                # The pipeline often returns the full prompt + generation. We need to extract just the generated part.
+                full_text = llm_results[0]["generated_text"]
+                # Extract only the part generated by the model
+                # This logic depends on how the pipeline returns the text and if it includes the prompt.
+                # For Gemma, the response starts after the <start_of_turn>model\n sequence.
+                model_response_start_tag = "<start_of_turn>model\n" # Or similar based on actual output
+                
+                # A more robust way if apply_chat_template was used for prompt construction:
+                # The generated text is usually appended directly.
+                # If the prompt was included in `full_text`, we need to strip it.
+                # This is a common challenge with pipelines.
+                # Let's assume for now the pipeline returns *only* the newly generated text,
+                # or that the `apply_chat_template` and pipeline settings handle this.
+                # If `full_text` includes the prompt, we need to find where the actual model output begins.
+                
+                # A common pattern is that the generated text is what comes *after* the input prompt.
+                # If `prompt_for_llm` was the input, then `full_text[len(prompt_for_llm):]` would be the generation.
+                # However, pipelines sometimes re-format.
+                # Let's try to find the JSON directly.
+                
+                generated_part = full_text
+                if full_text.startswith(prompt_for_llm): # If prompt is prepended
+                    generated_part = full_text[len(prompt_for_llm):]
+                
+                # More robust: find the JSON structure
+                match = re.search(r'\{.*\}', generated_part)
+                if match:
+                    json_string = match.group(0)
+                    try:
+                        data = json.loads(json_string)
+                        suggested_emoji = data.get("emoji", "")
+                        if isinstance(suggested_emoji, str): # Ensure it's a string
+                             print(f"Local LLM suggested emoji: '{suggested_emoji}' for: '{message_content[:30]}...'")
+                             return suggested_emoji.strip()
+                        else:
+                             print(f"Local LLM returned non-string emoji: {suggested_emoji}")
+                             return ""
+                    except json.JSONDecodeError as e:
+                        print(f"Error decoding JSON from local LLM: {e}. Output: '{json_string}'")
+                        return ""
+                    except Exception as e:
+                        print(f"Error processing local LLM JSON: {e}. Output: '{json_string}'")
+                        return ""
+                else:
+                    print(f"No JSON object found in local LLM output: '{generated_part}'")
+                    return ""
             else:
-                await interaction.followup.send(response_text)
+                print(f"Local LLM returned no valid result or unexpected format: {llm_results}")
+                return ""
 
+        except asyncio.TimeoutError:
+            print(f"Local LLM reaction suggestion timed out for: '{message_content[:30]}...'")
+            return ""
         except Exception as e:
-            print(f"Error in /chat command for user {user_name} ({user_id}): {e}")
-            import traceback
-            traceback.print_exc()
-            await interaction.followup.send("Oh no! Something went wrong while I was trying to respond. My circuits are buzzing! 😵 Please try again.")
+            print(f"Error during local LLM reaction suggestion: {e}")
+            # import traceback
+            # traceback.print_exc() # For more detailed debugging if needed
+            return ""
+    # ---------------------------------
 
-    # --- Discord Event Listeners ---
+    # --- is_safe_command, run_shell_command, timeout_user, search_internet methods remain the same ---
+    # (Make sure SERPAPI_KEY is set in your environment for search to work)
+    def is_safe_command(self, command: str) -> bool:
+        """Check if a shell command is safe to run, allowing ping targets."""
+        command = command.strip()
+        if not command:
+            return False
+
+        parts = command.split()
+        cmd_name = parts[0].lower()
+
+        # 1. Check against explicitly blocked command names
+        dangerous_commands = [
+            "rm", "del", "format", "mkfs", "dd", "sudo", "su", "chmod", "chown",
+            "passwd", "fdisk", "mount", "umount", "curl", "wget", "apt", "yum",
+            "dnf", "pacman", "brew", "pip", "npm", "yarn", "gem", "composer",
+            "cargo", "go", "systemctl", "service", "init", "shutdown", "reboot",
+            "poweroff", "halt", "kill", "pkill", "killall", "useradd", "userdel",
+            "groupadd", "groupdel", "visudo", "crontab", "ssh", "telnet", "nc",
+            "netcat", "iptables", "ufw", "firewall-cmd", "cat", ":(){:|:&};:",
+            "eval", "exec", "source", ".", # '.' is source alias
+        ]
+        if cmd_name in dangerous_commands:
+            print(f"Unsafe command blocked (dangerous command name): {command}")
+            return False
+
+        # 2. Check if command is in the allowed list
+        safe_command_starts = [
+            "echo", "date", "uptime", "whoami", "hostname", "uname", "pwd", "ls",
+            "dir", "type", "head", "tail", "wc", "grep", "find", "ping",
+            "traceroute", "tracepath", "netstat", "ifconfig", "ipconfig", "ip", # 'ip addr' etc.
+            "ps", "top", "htop", "free", "df", "du"
+        ]
+        # Allow specific 'ip' subcommands if needed, e.g., 'ip addr', 'ip link'
+        if cmd_name == "ip" and len(parts) > 1 and parts[1].lower() in ["addr", "link", "route"]:
+             pass # Allow specific 'ip' subcommands
+        elif cmd_name not in safe_command_starts:
+            print(f"Unsafe command blocked (not in safe list): {command}")
+            return False
+
+        # 3. Check arguments for dangerous characters/patterns
+        dangerous_chars = [">", "<", "|", "&", ";", "`", "$", "*", "?", "[", "]", "{", "}", "\\", "'", "\"", "(", ")"] # Removed '.' and '-'
+        # Regex for basic validation of hostname/IP for ping
+        # Allows alphanumeric, dot, hyphen, colon (for IPv6)
+        # Does NOT perfectly validate, but blocks most shell metacharacters
+        hostname_ip_pattern = re.compile(r"^[a-zA-Z0-9\.\-:]+$")
+        # Allows simple options like -c, -t, -4, -6 and numbers
+        ping_options_pattern = re.compile(r"^-([a-zA-Z0-9]+)$")
+        numeric_pattern = re.compile(r"^[0-9]+$")
+
+        for i, part in enumerate(parts):
+            # Check all parts for the most dangerous characters
+            for char in dangerous_chars:
+                if char in part:
+                    print(f"Unsafe command blocked (dangerous char '{char}' in '{part}'): {command}")
+                    return False
+
+            # Specific checks for ping arguments (after the command name)
+            if cmd_name == "ping" and i > 0:
+                 # Allow simple options or numbers
+                 if ping_options_pattern.match(part) or numeric_pattern.match(part):
+                     continue
+                 # Allow the target hostname/IP
+                 elif hostname_ip_pattern.match(part):
+                     continue
+                 else:
+                     # Argument for ping is not a simple option, number, or valid-looking host/IP
+                     print(f"Unsafe command blocked (invalid ping argument '{part}'): {command}")
+                     return False
+            # Add checks for other commands if their arguments need specific validation
+            # Example: prevent 'ls /etc' - though '/' isn't in dangerous_chars, maybe add checks for sensitive paths?
+            # For now, rely on dangerous_chars blocking most injection attempts for other commands.
+
+        # If all checks passed
+        return True
+
+    async def run_shell_command(self, command: str) -> str:
+        """Run a shell command and return the output"""
+        try:
+            # Use asyncio.create_subprocess_shell for better control
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=1024*100 # Limit buffer size (e.g., 100KB) to prevent memory issues
+            )
+            
+            # Wait for the command to complete with a timeout (e.g., 10 seconds)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
+            
+            # Decode output safely
+            stdout_str = stdout.decode('utf-8', errors='replace').strip()
+            stderr_str = stderr.decode('utf-8', errors='replace').strip()
+
+            # Combine output, prioritizing stdout
+            if process.returncode == 0:
+                output = stdout_str if stdout_str else "(Command executed successfully with no output)"
+                if stderr_str: # Include stderr even on success if it exists
+                    output += f"\n[Stderr: {stderr_str}]"
+            else:
+                output = f"(Command failed with exit code {process.returncode})"
+                if stderr_str:
+                    output += f"\nError Output:\n{stderr_str}"
+                elif stdout_str: # Sometimes errors print to stdout
+                     output += f"\nOutput (might contain error):\n{stdout_str}"
+
+            # Limit overall output size before returning
+            max_output_len = 1500 # Adjust as needed for Discord message limits
+            if len(output) > max_output_len:
+                output = output[:max_output_len - 3] + "..."
+            
+            return output
+
+        except asyncio.TimeoutError:
+            # Ensure process is terminated if it times out
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                    await process.wait() # Wait briefly for termination
+                except ProcessLookupError:
+                    pass # Process already finished
+                except Exception as term_err:
+                     print(f"Error terminating timed-out process: {term_err}")
+            return "Command timed out after 10 seconds."
+        except FileNotFoundError:
+             return f"Error: Command not found or invalid command: '{command.split()[0]}'"
+        except Exception as e:
+            return f"Error running command: {str(e)}"
+
+    # --- Other Methods (timeout_user, search_internet, check_admin_permissions - Unchanged) ---
+    async def timeout_user(self, guild_id: int, user_id: int, minutes: int) -> bool:
+        # (Same implementation as previous version)
+        try:
+            guild = self.bot.get_guild(guild_id)
+            if not guild: return False
+            member = await guild.fetch_member(user_id) 
+            if not member: return False
+            if not guild.me.guild_permissions.moderate_members: return False
+            if member.top_role >= guild.me.top_role: return False
+            duration = timedelta(minutes=min(minutes, 40320)) 
+            await member.timeout(duration, reason=f"Timed out by Kasane Teto via AI command")
+            return True
+        except Exception as e:
+            print(f"Error timing out user {str(user_id)}: {e}")
+            return False
+
+    async def search_internet(self, query: str) -> str:
+         # (Same implementation as previous version - uses SerpApi)
+        serp_api_key = os.getenv("SERP_API_KEY") 
+        if not serp_api_key: return "Search is disabled (missing API key)."
+        try:
+            encoded_query = urllib.parse.quote(query)
+            url = f"https://serpapi.com/search.json?q={encoded_query}&api_key={serp_api_key}&engine=google"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=15.0) as response: 
+                    if response.status == 200:
+                        data = await response.json(); results = []
+                        # Extract Answer Box / Knowledge Graph / Organic Results (same logic)
+                        summary = None
+                        if data.get("answer_box"): ab = data["answer_box"]; summary = ab.get("answer") or ab.get("snippet")
+                        if summary: results.append(f"**Summary:** {(summary[:300] + '...') if len(summary) > 300 else summary}")
+                        if not summary and data.get("knowledge_graph"):
+                            kg = data["knowledge_graph"]
+                            title = kg.get("title", "")
+                            desc = kg.get("description", "")
+                            if title and desc:
+                                kg_text = f"{title}: {desc}"
+                                results.append(f"**Info:** {(kg_text[:350] + '...') if len(kg_text) > 350 else kg_text}")
+                            if kg.get("source", {}) and kg.get("source", {}).get("link"):
+                                results.append(f"  Source: <{kg['source']['link']}>")
+                        if "organic_results" in data:
+                            count = 0
+                            max_r = 2 if results else 3
+                            for r in data["organic_results"]:
+                                if count >= max_r:
+                                    break
+                                t = r.get("title", "")
+                                l = r.get("link", "#")
+                                s = r.get("snippet", "").replace("\n", " ").strip()
+                                s = (s[:250] + '...') if len(s) > 250 else s
+                                results.append(f"**{t}**: {s}\n  Link: <{l}>")
+                                count += 1
+                        return "\n\n".join(results) if results else "No relevant results found."
+                    else: error_text = await response.text(); print(f"SerpApi Error: {response.status} - {error_text}"); return f"Search error ({response.status})."
+        except Exception as e: print(f"Error searching internet: {e}"); return f"Search failed: {str(e)}"
+
+    async def check_admin_permissions(self, interaction: discord.Interaction) -> bool:
+        # (Same implementation as previous version)
+        if not interaction.guild: await interaction.followup.send("This command only works in a server."); return False
+        if interaction.channel.permissions_for(interaction.user).administrator: return True
+        await interaction.followup.send("Hehe, you need **Administrator** powers for this! ✨", ephemeral=True); return False
+    # -------------------------
+
+    # --- Slash Commands ---
+    @app_commands.command(name="talk")
+    @app_commands.describe(prompt="What do you want to say to Teto?")
+    async def slash_ai(self, interaction: discord.Interaction, prompt: str):
+        await interaction.response.defer()
+        user_id = str(interaction.user.id)
+        user_name = interaction.user.display_name
+        # Pass the interaction object to generate_response
+        try:
+            response = await self.generate_response(user_id, user_name, prompt, source_interaction=interaction)
+            # Split long messages
+            if len(response) > 2000:
+                 for chunk in [response[i:i+1990] for i in range(0, len(response), 1990)]:
+                      await interaction.followup.send(chunk, suppress_embeds=True) # Suppress embeds for chunks
+            else:
+                 await interaction.followup.send(response, suppress_embeds=True)
+        except Exception as e:
+            print(f"Error in slash_ai: {e}")
+            await interaction.followup.send(f"A critical error occurred processing that request. Please tell my developer! Error: {type(e).__name__}")
+
+    @aimanage.command(name="config", description="Configure AI settings (Admin Only)")
+    @app_commands.describe( # Descriptions updated slightly
+        model="Together AI model identifier (e.g., 'mistralai/Mixtral-8x7B-Instruct-v0.1')",
+        temperature="AI creativity/randomness (0.0-2.0).",
+        max_tokens="Max response length (1-16384).", # Range updated
+        top_p="Nucleus sampling probability (0.0-1.0).",
+        frequency_penalty="Penalty for repeating tokens (-2.0-2.0).",
+        presence_penalty="Penalty for repeating topics (-2.0-2.0)."
+    )
+    async def slash_aiconfig(
+        self, interaction: discord.Interaction, 
+        model: Optional[str] = None,
+        temperature: Optional[app_commands.Range[float,0.0,2.0]] = None, 
+        max_tokens: Optional[app_commands.Range[int, 1, 16384]] = None,
+        top_p: Optional[app_commands.Range[float, 0.0, 1.0]] = None,
+        frequency_penalty: Optional[app_commands.Range[float, -2.0, 2.0]] = None, # type: ignore
+        presence_penalty: Optional[app_commands.Range[float, -2.0, 2.0]] = None # type: ignore
+    ):
+         # (Implementation remains the same, using Range for validation)
+        await interaction.response.defer(ephemeral=True) 
+        if not await self.check_admin_permissions(interaction): return
+        user_id = str(interaction.user.id) # Still configures the *admin's* personal settings
+        if user_id not in self.user_configs: self.user_configs[user_id] = self.default_config.copy()
+        changes = []; current_config = self.user_configs[user_id]
+        if model is not None:
+             if "/" in model and len(model) > 3: current_config["model"] = model; changes.append(f"Model: `{model}`")
+             else: await interaction.followup.send(f"Invalid model format: `{model}`."); return
+        if temperature is not None: current_config["temperature"] = temperature; changes.append(f"Temperature: `{temperature}`")
+        if max_tokens is not None: current_config["max_tokens"] = max_tokens; changes.append(f"Max Tokens: `{max_tokens}`")
+        if top_p is not None: current_config["top_p"] = top_p; changes.append(f"Top P: `{top_p}`")
+        if frequency_penalty is not None: current_config["frequency_penalty"] = frequency_penalty; changes.append(f"Frequency Penalty: `{frequency_penalty}`")
+        if presence_penalty is not None: current_config["presence_penalty"] = presence_penalty; changes.append(f"Presence Penalty: `{presence_penalty}`")
+        if not changes: await interaction.followup.send("No settings changed.", ephemeral=True); return
+        self.save_configs()
+        config = self.user_configs[user_id]
+        config_message = (f"Okay~! {interaction.user.mention} updated your AI config:\n" + "\n".join([f"- {k.replace('_',' ').title()}: `{v}`" for k, v in config.items()]) + "\n\nChanges:\n- " + "\n- ".join(changes))
+        await interaction.followup.send(config_message) # Sends publicly
+
+    @aimanage.command(name="addcontext", description="Add a piece of context for the AI (Admin Only)")
+    @app_commands.describe(text="The context snippet to add.")
+    async def slash_context(self, interaction: discord.Interaction, text: str):
+        """Adds a text snippet to the global manual context list for the AI."""
+        await interaction.response.defer(ephemeral=True)
+        if not await self.check_admin_permissions(interaction):
+            return # Check handles the response
+
+        if self.add_manual_context(text):
+            await interaction.followup.send(f"Okay~! Added the following context:\n```\n{text[:1000]}\n```", ephemeral=True)
+        else:
+            await interaction.followup.send("Hmm, I couldn't add that context. Maybe it was empty or already exists?", ephemeral=True)
+
+    @aimanage.command(name="addexample", description="Add a dynamic learning example for the AI (Admin Only)")
+    @app_commands.describe(text="The learning example text to add.")
+    async def slash_addlearning(self, interaction: discord.Interaction, text: str):
+        """Adds a text snippet to the global dynamic learning list for the AI."""
+        await interaction.response.defer(ephemeral=True)
+        if not await self.check_admin_permissions(interaction):
+            return # Check handles the response
+
+        if self.add_dynamic_learning(text):
+            await interaction.followup.send(f"Okay~! Added the following learning example:\n```\n{text[:1000]}\n```", ephemeral=True)
+        else:
+            await interaction.followup.send("Hmm, I couldn't add that learning example. Maybe it was empty or already exists?", ephemeral=True)
+
+    @aimanage.command(name="channel", description="Toggle Teto responding to *all* messages here (Admin Only)")
+    async def slash_aichannel(self, interaction: discord.Interaction):
+        # (Implementation remains the same)
+        await interaction.response.defer()
+        if not await self.check_admin_permissions(interaction): await interaction.edit_original_response(content="You need administrator permissions!"); return
+        if not interaction.channel: await interaction.followup.send("Cannot use here."); return
+        channel_id = interaction.channel.id
+        if channel_id in self.active_channels: self.active_channels.remove(channel_id); await interaction.followup.send(f"Okay! I won't reply to *every* message in {interaction.channel.mention} anymore. 😊")
+        else: self.active_channels.add(channel_id); await interaction.followup.send(f"Yay! 🎉 I'll now respond to **all** messages in {interaction.channel.mention}!")
+    # -------------------------
+
+    # --- Listener ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Handles messages to respond when the bot is pinged."""
-        # Ignore messages from the bot itself
-        if message.author == self.bot.user:
-            return
+        if message.author == self.bot.user: return # Allow bot responses
+        ctx = await self.bot.get_context(message); 
+        if ctx.valid: return # Let command processing handle valid commands
 
-        # Check if the bot is mentioned in the message
-        # message.mentions contains a list of User/Member objects mentioned
-        if self.bot.user in message.mentions:
-            # Extract the message content after the mention
-            # This regex finds the bot mention at the start and captures the rest
-            mention_regex = re.compile(rf"<@!?{self.bot.user.id}>\s*")
-            content = mention_regex.sub("", message.content).strip()
+        user_id = str(message.author.id)
+        user_name = message.author.display_name
+        channel_id = message.channel.id if message.channel else None # Keep channel_id check for active_channels
 
-            if not content:
-                # If only the bot was mentioned with no text, maybe send a default greeting or ignore
-                # For now, let's ignore empty messages after mention
-                return
+        should_respond = False; prompt = message.content; response_prefix = ""
+        mention_pattern = f'<@!?{self.bot.user.id}>'
+        
+        if re.match(mention_pattern, message.content) or self.bot.user in message.mentions:
+            should_respond = True; prompt = re.sub(mention_pattern, '', message.content).strip(); prompt = prompt or "Hey Teto!"
+        elif channel_id in self.active_channels:
+            should_respond = True
+        elif re.search(rf'\b{re.escape(self.bot.user.name)}\b', message.content, re.IGNORECASE):
+             should_respond = True
+             if channel_id not in self.active_channels: response_prefix = f"{message.author.mention} "
+        
+        # --- Decide whether to reply or just react ---
+        if should_respond and prompt and self.api_key:
+            # Generate and send a text reply
+            async with message.channel.typing():
+                try:
+                    response = await self.generate_response(user_id, user_name, prompt, source_message=message)
+                    reply_func = message.reply if hasattr(message, 'reply') else message.channel.send
+                    final_response = response_prefix + response
 
-            # Process the message content using the AI
-            user_id = str(message.author.id)
-            user_name = message.author.display_name
+                    # Split long messages
+                    if len(final_response) > 2000:
+                         first_chunk = True
+                         for chunk in [final_response[i:i+1990] for i in range(0, len(final_response), 1990)]:
+                              send_func = reply_func if first_chunk else message.channel.send
+                              await send_func(chunk, suppress_embeds=True)
+                              first_chunk = False
+                    else:
+                         await reply_func(final_response, suppress_embeds=True)
 
-            # Indicate bot is thinking (optional for message listener, but good practice)
-            # await message.channel.trigger_typing() # This can be spammy in busy channels
+                except Exception as e:
+                    print(f"Error during on_message generation/sending: {e}")
+                    # Maybe add a cooldown to sending error messages in chat
+                    # await message.channel.send("Oops, Teto brain freeze! 🧠❄️ Try again?")
+        elif not should_respond and self.api_key: # Only react if not already replying
+            reaction_chance = 0.05 # 5% chance to initiate reaction process
+            
+            if random.random() < reaction_chance:
+                chosen_emoji_to_react = ""
 
-            try:
-                response_text = await self.generate_response(user_id, user_name, content, source_message=message)
+                # Try to get emoji from local LLM
+                if self.reaction_pipeline:
+                    suggested_emoji_from_llm = await self.get_local_reaction_emoji_suggestion(prompt) # Use original prompt
+                    if suggested_emoji_from_llm: # If LLM provided a specific emoji
+                        chosen_emoji_to_react = suggested_emoji_from_llm
+                
+                # Fallback if LLM didn't provide an emoji (or LLM not available)
+                if not chosen_emoji_to_react:
+                    teto_emojis = ['🍞', '🥖', '✨', '💖', '🎤', '🎶', '😊', '😄', '😉', '😋', '🎉', '👍'] # Removed custom for simplicity now
+                    # Add custom emojis if they are verified to be accessible by the bot
+                    # Example: custom_emoji_id = 123456789012345678
+                    # if self.bot.get_emoji(custom_emoji_id):
+                    # teto_emojis.append(str(self.bot.get_emoji(custom_emoji_id)))
+                    
+                    # Filter out custom emojis the bot might not have access to (if any were added as strings)
+                    valid_emojis = []
+                    for emoji_str in teto_emojis:
+                        if isinstance(emoji_str, str) and emoji_str: # Standard unicode emoji
+                            valid_emojis.append(emoji_str)
+                        # else: # Could add check for custom emoji availability if needed (complex for this spot)
+                        #    pass
+                    if valid_emojis:
+                        chosen_emoji_to_react = random.choice(valid_emojis)
 
-                # Send response in chunks if too long
-                if len(response_text) > 2000:
-                    for i in range(0, len(response_text), 1990):
-                        chunk = response_text[i:i+1990]
-                        await message.channel.send(chunk)
-                else:
-                    await message.channel.send(response_text)
+                # Add the chosen reaction if one was determined
+                if chosen_emoji_to_react:
+                    try:
+                        await message.add_reaction(chosen_emoji_to_react)
+                    except discord.Forbidden:
+                        pass # Ignore if missing reaction permissions
+                    except discord.HTTPException as e:
+                        # Catch specific error for "Unknown Emoji"
+                        if e.code == 10014: # Discord API error code for Unknown Emoji
+                            print(f"Failed to add reaction: Unknown Emoji '{chosen_emoji_to_react}'. LLM might have hallucinated an invalid emoji.")
+                        else:
+                            print(f"Failed to add reaction '{chosen_emoji_to_react}': {e}") # Log other HTTP errors
+            # ---------------------------------
 
-            except Exception as e:
-                print(f"Error in on_message for user {user_name} ({user_id}): {e}")
-                import traceback
-                traceback.print_exc()
-                await message.channel.send("Oh no! Something went wrong while I was trying to respond to your mention. 😵")
+    # -------------------------
 
-        # Allow other message processing (e.g., commands) to continue
-        await self.bot.process_commands(message)
-
-
-    # --- Discord Slash Commands ---
-    @app_commands.command(name="setaiconfig", description="Set your personal AI model configuration (e.g., temperature).")
-    @app_commands.describe(
-        model="Model identifier (optional, consult bot owner for available models)",
-        temperature="Model temperature (0.0-2.0, e.g., 0.7)",
-        max_tokens="Max tokens for response (e.g., 1000)",
-        top_p="Top P sampling (0.0-1.0, e.g., 0.9)"
-    )
-    async def set_ai_config_command(self, interaction: discord.Interaction, 
-                                    model: Optional[str] = None, 
-                                    temperature: Optional[app_commands.Range[float, 0.0, 2.0]] = None,
-                                    max_tokens: Optional[app_commands.Range[int, 50, 4000]] = None, # Adjust range as per API limits
-                                    top_p: Optional[app_commands.Range[float, 0.0, 1.0]] = None):
-        """Allows users to set their AI configuration."""
-        user_id = str(interaction.user.id)
-        current_config = self.get_user_config(user_id) # Gets a copy
-
-        updated = False
-        if model is not None:
-            # Potentially validate model against a list of allowed/known models if you want to restrict this
-            current_config["model"] = model
-            updated = True
-        if temperature is not None:
-            current_config["temperature"] = temperature
-            updated = True
-        if max_tokens is not None:
-            # IMPORTANT: Ensure 'max_tokens' is the correct parameter name for Meta Llama API
-            current_config["max_tokens"] = max_tokens 
-            updated = True
-        if top_p is not None:
-            current_config["top_p"] = top_p
-            updated = True
-
-        if updated:
-            self.user_configs[user_id] = current_config # Update the stored config
-            self.save_configs()
-            await interaction.response.send_message("Your AI configuration has been updated! ✨", ephemeral=True)
-        else:
-            await interaction.response.send_message("No changes were made. Provide at least one parameter to update.", ephemeral=True)
-
-    @app_commands.command(name="getaiconfig", description="View your current AI model configuration.")
-    async def get_ai_config_command(self, interaction: discord.Interaction):
-        """Shows the user their current AI configuration."""
-        user_id = str(interaction.user.id)
-        config = self.get_user_config(user_id)
-        config_str = "\n".join([f"**{k}**: {v}" for k, v in config.items()])
-        embed = discord.Embed(title=f"{interaction.user.display_name}'s AI Configuration", description=config_str, color=discord.Color.blue())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="addfact", description="Manually add a fact for the AI to remember about you.")
-    @app_commands.describe(fact="The fact to remember (e.g., 'My favorite food is bread').")
-    async def add_fact_command(self, interaction: discord.Interaction, fact: str):
-        """Allows a user to manually add a fact to their own memory."""
-        user_id = str(interaction.user.id)
-        user_name = interaction.user.display_name
-        self.add_user_fact(user_id, fact)
-        await interaction.response.send_message(f"Okay, {user_name}, I'll try to remember that: '{fact}'", ephemeral=True)
-
-    @app_commands.command(name="viewfacts", description="View the facts the AI remembers about you.")
-    async def view_facts_command(self, interaction: discord.Interaction):
-        """Allows a user to view their remembered facts."""
-        user_id = str(interaction.user.id)
-        user_name = interaction.user.display_name
-        facts = self.get_user_facts(user_id)
-        if facts:
-            facts_str = "\n".join([f"- {f}" for f in facts])
-            embed = discord.Embed(title=f"Facts I Remember About {user_name}", description=facts_str, color=discord.Color.green())
-        else:
-            embed = discord.Embed(title=f"Facts I Remember About {user_name}", description="I don't seem to have any specific facts stored for you yet!", color=discord.Color.orange())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="addcontext", description="[Admin] Add a global manual context string for the AI.")
-    @app_commands.describe(text="The context string to add.")
-    @app_commands.checks.has_permissions(administrator=True) # Example permission
-    async def add_manual_context_command(self, interaction: discord.Interaction, text: str):
-        if self.add_manual_context(text):
-            await interaction.response.send_message(f"Added to manual context: '{text[:100]}...'", ephemeral=True)
-        else:
-            await interaction.response.send_message("Context already exists or is empty.", ephemeral=True)
-    
-    @add_manual_context_command.error
-    async def add_manual_context_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message("Sorry, you don't have permission to use this command!", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
-
-
-    @app_commands.command(name="adddynamic", description="[Admin] Add a global dynamic learning example for the AI.")
-    @app_commands.describe(text="The dynamic learning example (e.g., 'User asks for help -> Offer assistance politely').")
-    @app_commands.checks.has_permissions(administrator=True) # Example permission
-    async def add_dynamic_learning_command(self, interaction: discord.Interaction, text: str):
-        if self.add_dynamic_learning(text):
-            await interaction.response.send_message(f"Added to dynamic learning: '{text[:100]}...'", ephemeral=True)
-        else:
-            await interaction.response.send_message("Dynamic learning example already exists or is empty.", ephemeral=True)
-
-    @add_dynamic_learning_command.error
-    async def add_dynamic_learning_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message("Sorry, you don't have permission to use this command!", ephemeral=True)
-        else:
-            await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
-
-
+# --- Setup Function (Checks remain the same) ---
 async def setup(bot: commands.Bot):
-    # Ensure data directory exists upon setup
-    if not os.path.exists(DATA_DIR):
-        try:
-            os.makedirs(DATA_DIR)
-            print(f"Created data directory during setup: {DATA_DIR}")
-        except OSError as e:
-            print(f"FATAL during setup: Could not create data directory {DATA_DIR}. Error: {e}")
-            # Depending on strictness, you might prevent the cog from loading
-            # raise e 
-    
-    # Create default files if they don't exist, with empty JSON structures
-    default_files_to_check = {
-        DEFAULT_MEMORY_PATH: {},
-        DEFAULT_HISTORY_PATH: {},
-        DEFAULT_MANUAL_CONTEXT_PATH: [],
-        DEFAULT_DYNAMIC_LEARNING_PATH: [],
-        DEFAULT_CONFIG_PATH: {}
-    }
-    for file_path, default_content in default_files_to_check.items():
-        if not os.path.exists(file_path):
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(default_content, f, indent=4)
-                print(f"Created default empty file: {file_path}")
-            except Exception as e:
-                print(f"Error creating default file {file_path}: {e}")
+    ai_api_key = os.getenv("AI_API_KEY")
+    serpapi_key = os.getenv("SERPAPI_KEY")
+    memory_path = os.getenv("BOT_MEMORY_PATH", DEFAULT_MEMORY_PATH)
+    history_path = os.getenv("BOT_HISTORY_PATH", DEFAULT_HISTORY_PATH)
+    manual_context_path = os.getenv("BOT_MANUAL_CONTEXT_PATH", DEFAULT_MANUAL_CONTEXT_PATH)
+    dynamic_learning_path = os.getenv("BOT_DYNAMIC_LEARNING_PATH", DEFAULT_DYNAMIC_LEARNING_PATH)
 
-    await bot.add_cog(AICog(bot))
-    print("AICog loaded successfully.")
+
+    print("-" * 60) # Separator for clarity
+    # Check AI Key
+    if not ai_api_key:
+        print("!!! WARNING: AI_API_KEY not set. AI features WILL NOT WORK. Ensure it contains your OpenRouter key. !!!")
+    else:
+        print(f"AI_API_KEY loaded (ends with ...{ai_api_key[-4:]}). Using OpenRouter API.") # Updated print statement
+
+    # Check Search Key
+    if not serpapi_key:
+        print("--- INFO: SERPAPI_KEY not set. Internet search will be disabled. ---")
+    else:
+        print("SERPAPI_KEY loaded. Internet search enabled.")
+
+    # Report Data Paths
+    print(f"Bot memory path: {memory_path}")
+    print(f"Conversation history path: {history_path}")
+    print(f"Manual context path: {manual_context_path}")
+    print(f"Dynamic learning path: {dynamic_learning_path}")
+    # TODO: Add checks here if the directories/files are writable at startup.
+
+    print("-" * 60)
+
+    # Add the cog
+    try:
+        await bot.add_cog(AICog(bot))
+        print("AICog loaded successfully.")
+    except Exception as e:
+        print(f"\n!!! FATAL ERROR: Failed to load AICog! Reason: {e} !!!\n")
+        # Depending on your bot structure, you might want to exit or prevent startup here
